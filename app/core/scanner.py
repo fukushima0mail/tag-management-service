@@ -2,13 +2,22 @@ import os
 
 from PyQt6.QtCore import QThread, pyqtSignal
 
-from core.media import extension_tag, iter_media_files, load_media_info
+from core.media import extension_tag, is_same_or_under, iter_media_files, load_media_info
+from db.exclusions import get_excluded_paths
 from db.tags import add_tag
 from db.videos import add_video, delete_videos, get_video_index
 
 
-def _is_under(path: str, directory: str) -> bool:
-    return os.path.normcase(path).startswith(os.path.normcase(os.path.join(directory, "")))
+def _is_excluded(path: str, excluded: set[str]) -> bool:
+    """path 自身、またはその上位フォルダのいずれかが除外対象か"""
+    path = os.path.normcase(path)
+    while True:
+        if path in excluded:
+            return True
+        parent = os.path.dirname(path)
+        if parent == path:
+            return False
+        path = parent
 
 
 class ScanWorker(QThread):
@@ -17,19 +26,25 @@ class ScanWorker(QThread):
     progress = pyqtSignal(int, int, str)       # 処理済み件数, 総件数, ファイルパス
     scan_finished = pyqtSignal(int, int, int)  # 追加, 更新, 削除
 
-    def __init__(self, directories: list[str], parent=None):
+    def __init__(self, directories: list[str], tags: list[str] | None = None, parent=None):
         super().__init__(parent)
         self.directories = [os.path.normpath(d) for d in directories]
+        self.tags = tags or []  # スキャン対象のすべてのファイルに付与するタグ
 
     def run(self):
+        excluded = get_excluded_paths()
         files = []
         for directory in self.directories:
-            files.extend(iter_media_files(directory))
+            # 明示的に追加したフォルダは、その上位フォルダの除外設定より優先する
+            rules = {os.path.normcase(e) for e in excluded if not is_same_or_under(directory, e)}
+            files.extend(p for p in iter_media_files(directory) if not _is_excluded(p, rules))
 
         index = get_video_index()
         added = updated = 0
+        scanned_ids = []
         for i, path in enumerate(files, 1):
             if self.isInterruptionRequested():
+                self._add_tags(scanned_ids)
                 self.scan_finished.emit(added, updated, 0)
                 return
             self.progress.emit(i, len(files), path)
@@ -42,15 +57,19 @@ class ScanWorker(QThread):
             # サイズ・更新日時が変わっていないファイルは再処理しない
             existing = index.get(path)
             if existing and existing[1] == stat.st_size and existing[2] == stat.st_mtime:
+                scanned_ids.append(existing[0])
                 continue
 
             media_type, duration, thumbnail = load_media_info(path)
             video_id = add_video(path, media_type, duration, thumbnail, stat.st_size, stat.st_mtime)
             add_tag([video_id], extension_tag(path))
+            scanned_ids.append(video_id)
             if existing:
                 updated += 1
             else:
                 added += 1
+
+        self._add_tags(scanned_ids)
 
         # スキャン対象フォルダから消えたファイルをDBから削除
         # （フォルダ自体が見つからない場合は、外付けドライブ未接続などを考慮して削除しない）
@@ -58,7 +77,12 @@ class ScanWorker(QThread):
         available = [d for d in self.directories if os.path.isdir(d)]
         stale = [
             video_id for path, (video_id, _, _) in index.items()
-            if path not in found and any(_is_under(path, d) for d in available)
+            if path not in found and any(is_same_or_under(path, d) for d in available)
         ]
         delete_videos(stale)
         self.scan_finished.emit(added, updated, len(stale))
+
+    def _add_tags(self, video_ids: list[int]):
+        if video_ids:
+            for name in self.tags:
+                add_tag(video_ids, name)

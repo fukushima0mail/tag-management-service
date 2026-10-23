@@ -13,7 +13,8 @@ def create_videos_table():
                 added_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 media_type TEXT NOT NULL DEFAULT 'video',
                 file_size INTEGER,
-                modified_at REAL
+                modified_at REAL,
+                rating INTEGER NOT NULL DEFAULT 0
             )
         """)
 
@@ -24,6 +25,7 @@ def create_videos_table():
             ("media_type", "TEXT NOT NULL DEFAULT 'video'"),
             ("file_size", "INTEGER"),
             ("modified_at", "REAL"),
+            ("rating", "INTEGER NOT NULL DEFAULT 0"),
         ):
             if name not in columns:
                 c.execute(f"ALTER TABLE videos ADD COLUMN {name} {definition}")
@@ -55,6 +57,12 @@ def delete_videos(video_ids: list[int]):
         delete_unused_tags(c)
 
 
+def set_rating(video_ids: list[int], rating: int):
+    """評価（0: 未評価, 1〜10）を設定"""
+    with DBConnection() as c:
+        c.executemany("UPDATE videos SET rating = ? WHERE id = ?", [(rating, v) for v in video_ids])
+
+
 def get_video_index() -> dict[str, tuple[int, int | None, float | None]]:
     """file_path -> (id, file_size, modified_at)"""
     with DBConnection() as c:
@@ -66,7 +74,7 @@ def get_all_videos() -> list[dict]:
     """登録されているすべての動画・画像をタグ付きで取得（サムネイルは含まない）"""
     with DBConnection() as c:
         c.execute("""
-            SELECT id, file_path, media_type, duration, file_size, modified_at, added_at
+            SELECT id, file_path, media_type, duration, file_size, modified_at, added_at, rating
             FROM videos
         """)
         rows = c.fetchall()
@@ -81,9 +89,10 @@ def get_all_videos() -> list[dict]:
             "file_size": file_size,
             "modified_at": modified_at,
             "added_at": added_at,
+            "rating": rating,
             "tags": tags.get(video_id, []),
         }
-        for video_id, file_path, media_type, duration, file_size, modified_at, added_at in rows
+        for video_id, file_path, media_type, duration, file_size, modified_at, added_at, rating in rows
     ]
 
 

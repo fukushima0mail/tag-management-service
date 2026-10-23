@@ -33,6 +33,12 @@ def extension_tag(file_path: str) -> str:
     return os.path.splitext(file_path)[1].lstrip(".").lower()
 
 
+def is_same_or_under(path: str, directory: str) -> bool:
+    """path が directory 自身、またはその配下か（大文字小文字を区別しない環境にも対応）"""
+    path, directory = os.path.normcase(path), os.path.normcase(directory)
+    return path == directory or path.startswith(os.path.join(directory, ""))
+
+
 def iter_media_files(directory: str):
     """ディレクトリ配下（サブフォルダ含む）の動画・画像ファイルを列挙"""
     for root, _, files in os.walk(directory):
