@@ -4,12 +4,13 @@ import sys
 from collections import Counter
 from datetime import datetime
 
-from PyQt6.QtCore import QFile, QSettings, QSize, QStringListModel, Qt
-from PyQt6.QtGui import QIcon, QKeySequence, QPixmap, QShortcut
+from PyQt6.QtCore import QFile, QRect, QSettings, QSize, QStringListModel, Qt
+from PyQt6.QtGui import QColor, QFont, QFontMetrics, QIcon, QKeySequence, QPixmap, QShortcut
 from PyQt6.QtWidgets import (
     QCheckBox, QComboBox, QCompleter, QDialog, QDialogButtonBox, QFileDialog, QHBoxLayout, QInputDialog, QLabel,
     QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QProgressBar,
-    QPushButton, QSplitter, QStyle, QToolButton, QVBoxLayout, QWidget,
+    QPushButton, QSplitter, QStyle, QStyledItemDelegate, QStyleOptionViewItem, QToolButton,
+    QVBoxLayout, QWidget,
 )
 
 from core.media import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, get_media_type, is_same_or_under
@@ -36,10 +37,50 @@ TYPE_FILTERS = {"すべて": None, "動画": "video", "画像": "image"}
 TYPE_LABELS = {"video": "動画", "image": "画像"}
 MAX_RATING = 10
 INVALID_FILENAME_CHARS = '\\/:*?"<>|'
+RATING_ROLE = Qt.ItemDataRole.UserRole + 1  # サムネイル一覧の各項目に持たせる評価
+STAR_FILLED_COLOR = QColor("#FFC107")
+STAR_EMPTY_COLOR = QColor(255, 255, 255, 110)
+
+
+def rating_stars(rating: int) -> str:
+    return "★" * rating + "☆" * (MAX_RATING - rating)
 
 
 def format_rating(rating: int | None) -> str:
-    return f"{rating} / {MAX_RATING}" if rating else "未評価"
+    return f"{rating_stars(rating)} ({rating}/{MAX_RATING})" if rating else "未評価"
+
+
+class RatingDelegate(QStyledItemDelegate):
+    """サムネイルの下端に評価の★を重ねて描画する（未評価は何も描かない）"""
+
+    def paint(self, painter, option, index):
+        super().paint(painter, option, index)
+        rating = index.data(RATING_ROLE)
+        if not rating:
+            return
+
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        widget = opt.widget
+        icon_rect = widget.style().subElementRect(QStyle.SubElement.SE_ItemViewItemDecoration, opt, widget)
+
+        painter.save()
+        font = QFont(opt.font)
+        # 10個の★がサムネイル幅に収まる大きさにする
+        font.setPixelSize(max(8, icon_rect.width() // (MAX_RATING + 1)))
+        painter.setFont(font)
+        metrics = QFontMetrics(font)
+        strip = QRect(icon_rect.left(), icon_rect.bottom() - metrics.height(), icon_rect.width(), metrics.height() + 1)
+        painter.fillRect(strip, QColor(0, 0, 0, 150))
+
+        filled, empty = "★" * rating, "☆" * (MAX_RATING - rating)
+        x = strip.left() + (strip.width() - metrics.horizontalAdvance(filled + empty)) // 2
+        baseline = strip.top() + metrics.ascent()
+        painter.setPen(STAR_FILLED_COLOR)
+        painter.drawText(x, baseline, filled)
+        painter.setPen(STAR_EMPTY_COLOR)
+        painter.drawText(x + metrics.horizontalAdvance(filled), baseline, empty)
+        painter.restore()
 
 
 def parse_tags(text: str) -> list[str]:
@@ -239,6 +280,7 @@ class VideoTagApp(QMainWindow):
 
         # 中央: サムネイル一覧
         self.grid = ThumbnailGrid()
+        self.grid.setItemDelegate(RatingDelegate(self.grid))
         self.grid.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
         self.grid.itemSelectionChanged.connect(self.update_detail)
         self.grid.itemDoubleClicked.connect(
@@ -279,7 +321,7 @@ class VideoTagApp(QMainWindow):
         tag_input_row.addWidget(self.add_tag_button)
 
         self.rating_combo = QComboBox()
-        self.rating_combo.addItems(["未評価"] + [str(i) for i in range(1, MAX_RATING + 1)])
+        self.rating_combo.addItems(["未評価"] + [f"{rating_stars(i)}  {i}" for i in range(1, MAX_RATING + 1)])
         self.rating_combo.setPlaceholderText("（混在）")
         self.rating_combo.activated.connect(self.set_rating_to_selection)
         rating_row = QHBoxLayout()
@@ -405,6 +447,7 @@ class VideoTagApp(QMainWindow):
                 os.path.basename(video["file_path"]) if self.grid.show_labels else "",
             )
             item.setData(Qt.ItemDataRole.UserRole, video["id"])
+            item.setData(RATING_ROLE, video["rating"] or 0)
             item.setToolTip(
                 f"{video['file_path']}\n"
                 f"再生時間: {format_duration(video['duration'])}\n"
