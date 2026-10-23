@@ -3,12 +3,15 @@ import subprocess
 import sys
 from collections import Counter
 from datetime import datetime
+from urllib.parse import quote_plus
 
-from PyQt6.QtCore import QFile, QRect, QSettings, QSize, QStringListModel, Qt
-from PyQt6.QtGui import QColor, QFont, QFontMetrics, QIcon, QKeySequence, QPixmap, QShortcut
+from PyQt6.QtCore import QFile, QRect, QSettings, QSize, QStringListModel, Qt, QUrl
+from PyQt6.QtGui import (
+    QColor, QDesktopServices, QFont, QFontMetrics, QIcon, QKeySequence, QPixmap, QShortcut,
+)
 from PyQt6.QtWidgets import (
     QCheckBox, QComboBox, QCompleter, QDialog, QDialogButtonBox, QFileDialog, QHBoxLayout, QInputDialog, QLabel,
-    QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QProgressBar,
+    QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox, QProgressBar,
     QPushButton, QSplitter, QStyle, QStyledItemDelegate, QStyleOptionViewItem, QToolButton,
     QVBoxLayout, QWidget,
 )
@@ -293,6 +296,8 @@ class VideoTagApp(QMainWindow):
             shortcut = QShortcut(QKeySequence(key), self.grid)
             shortcut.setContext(Qt.ShortcutContext.WidgetShortcut)
             shortcut.activated.connect(slot)
+        self.grid.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.grid.customContextMenuRequested.connect(self.show_grid_menu)
 
         # 右: 詳細・タグ編集
         self.detail_label = QLabel()
@@ -735,6 +740,34 @@ class VideoTagApp(QMainWindow):
         self.statusBar().showMessage(f"スキャン完了: 追加 {added} / 更新 {updated} / 削除 {removed}", 10000)
         self.icons.clear()  # 更新されたファイルのサムネイルを読み直す
         self.reload_from_db()
+
+    def show_grid_menu(self, pos):
+        """サムネイル一覧の右クリックメニュー"""
+        item = self.grid.itemAt(pos)
+        if item is None:
+            return
+        # 未選択の項目を右クリックした場合は、その項目だけを選択し直す
+        if not item.isSelected():
+            self.grid.clearSelection()
+            item.setSelected(True)
+        video = self.video_by_id[item.data(Qt.ItemDataRole.UserRole)]
+        selected = len(self._selected_ids())
+
+        menu = QMenu(self)
+        menu.addAction("開く", lambda: self.open_file(video["file_path"]))
+        menu.addAction("Googleで検索", lambda: self.search_google(video["file_path"]))
+        menu.addSeparator()
+        rename = menu.addAction("名前を変更 (F2)", self.rename_selection)
+        rename.setEnabled(selected == 1 and not self.scanning)
+        for text, slot in (("DBから除外 (Delete)", self.exclude_selection),
+                           ("ファイルを削除 (Shift+Delete)", self.delete_selection)):
+            menu.addAction(text, slot).setEnabled(not self.scanning)
+        menu.exec(self.grid.viewport().mapToGlobal(pos))
+
+    def search_google(self, file_path: str):
+        """ファイル名（拡張子なし）をブラウザでGoogle検索"""
+        query = os.path.splitext(os.path.basename(file_path))[0]
+        QDesktopServices.openUrl(QUrl(f"https://www.google.com/search?q={quote_plus(query)}"))
 
     def open_file(self, file_path: str):
         """ダブルクリックでファイルを開く"""
