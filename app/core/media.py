@@ -1,5 +1,7 @@
 import io
+import json
 import os
+import subprocess
 
 from PIL import Image, ImageOps
 
@@ -16,6 +18,16 @@ IMAGE_EXTENSIONS = {
     ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tif", ".tiff",
 }
 THUMBNAIL_SIZE = (320, 180)
+# pythonw.exe（コンソールなし）で起動した場合に、ffmpeg 実行のたびにコンソール画面が開かないようにする
+NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+
+
+def _run(args: list[str]) -> bytes:
+    """外部コマンドを実行し、標準出力を返す（失敗時は標準エラーの内容で例外）"""
+    result = subprocess.run(args, capture_output=True, stdin=subprocess.DEVNULL, creationflags=NO_WINDOW)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.decode(errors="replace").strip())
+    return result.stdout
 
 
 def get_media_type(file_path: str) -> str | None:
@@ -62,7 +74,7 @@ def get_video_duration(file_path: str) -> float | None:
     if ffmpeg is None:
         return None
     try:
-        probe = ffmpeg.probe(file_path)
+        probe = json.loads(_run(["ffprobe", "-v", "error", "-show_format", "-of", "json", file_path]))
         return float(probe['format']['duration'])
     except Exception as e:
         print(f"エラー: 動画の再生時間を取得できませんでした ({file_path})\n{e}")
@@ -76,11 +88,12 @@ def generate_video_thumbnail(file_path: str, duration: float | None) -> bytes | 
     # 短い動画でも取得できるよう、5秒地点か動画の中間の早い方を使う
     position = min(5.0, duration / 2) if duration else 0
     try:
-        out, _ = (
+        out = _run(
             ffmpeg
             .input(file_path, ss=position)
             .output("pipe:", vframes=1, format="image2", vcodec="mjpeg")
-            .run(capture_stdout=True, capture_stderr=True)
+            .global_args("-hide_banner", "-v", "error")
+            .compile()
         )
         if not out:
             return None

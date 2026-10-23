@@ -7,7 +7,7 @@ from datetime import datetime
 from PyQt6.QtCore import QFile, QSettings, QSize, QStringListModel, Qt
 from PyQt6.QtGui import QIcon, QKeySequence, QPixmap, QShortcut
 from PyQt6.QtWidgets import (
-    QComboBox, QCompleter, QDialog, QDialogButtonBox, QFileDialog, QHBoxLayout, QInputDialog, QLabel,
+    QCheckBox, QComboBox, QCompleter, QDialog, QDialogButtonBox, QFileDialog, QHBoxLayout, QInputDialog, QLabel,
     QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QProgressBar,
     QPushButton, QSplitter, QStyle, QToolButton, QVBoxLayout, QWidget,
 )
@@ -86,7 +86,8 @@ class ThumbnailGrid(QListWidget):
 class AddTagsDialog(QDialog):
     """フォルダ・ファイル追加時に、追加するすべてのファイルへ付けるタグを指定する"""
 
-    def __init__(self, title: str, target: str, completer_model: QStringListModel, parent=None):
+    def __init__(self, title: str, target: str, completer_model: QStringListModel,
+                 new_only: bool = False, parent=None):
         super().__init__(parent)
         self.setWindowTitle(title)
         self.resize(420, 0)
@@ -97,6 +98,8 @@ class AddTagsDialog(QDialog):
         completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
         completer.setFilterMode(Qt.MatchFlag.MatchContains)
         self.tag_edit.setCompleter(completer)
+        self.new_only_check = QCheckBox("登録済みのファイルにはタグを付けない（新しく登録するファイルのみ）")
+        self.new_only_check.setChecked(new_only)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self.accept)
@@ -106,12 +109,16 @@ class AddTagsDialog(QDialog):
         target_label.setWordWrap(True)
         layout = QVBoxLayout(self)
         layout.addWidget(target_label)
-        layout.addWidget(QLabel("追加するすべてのファイルに付けるタグ（カンマ区切り）"))
+        layout.addWidget(QLabel("追加するファイルに付けるタグ（カンマ区切り）"))
         layout.addWidget(self.tag_edit)
+        layout.addWidget(self.new_only_check)
         layout.addWidget(buttons)
 
     def tags(self) -> list[str]:
         return parse_tags(self.tag_edit.text())
+
+    def new_only(self) -> bool:
+        return self.new_only_check.isChecked()
 
 
 def format_duration(seconds: float | None) -> str:
@@ -616,8 +623,8 @@ class VideoTagApp(QMainWindow):
         if not directory:
             return
         directory = os.path.normpath(directory)
-        dialog = AddTagsDialog("フォルダを追加", directory, self.completer_model, self)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
+        dialog = self._ask_add_tags("フォルダを追加", directory)
+        if not dialog:
             return
         directories = self._directories()
         if directory not in directories:
@@ -625,7 +632,7 @@ class VideoTagApp(QMainWindow):
             self.settings.setValue("directories", directories)
         # フォルダを追加し直した場合は、以前除外したファイル・フォルダも再登録する
         remove_excluded_paths([p for p in get_excluded_paths() if is_same_or_under(p, directory)])
-        self.start_scan([directory], dialog.tags())
+        self.start_scan([directory], dialog.tags(), tag_new_only=dialog.new_only())
 
     def choose_files(self):
         patterns = " ".join(f"*{ext}" for ext in sorted(VIDEO_EXTENSIONS | IMAGE_EXTENSIONS))
@@ -636,13 +643,13 @@ class VideoTagApp(QMainWindow):
         if not files:
             return
         target = os.path.basename(files[0]) if len(files) == 1 else f"{len(files)} 件のファイル"
-        dialog = AddTagsDialog("ファイルを追加", target, self.completer_model, self)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
+        dialog = self._ask_add_tags("ファイルを追加", target)
+        if not dialog:
             return
         # 以前DBから除外したファイルでも、個別に追加した場合は再登録する
         targets = {os.path.normcase(f) for f in files}
         remove_excluded_paths([p for p in get_excluded_paths() if os.path.normcase(p) in targets])
-        self.start_scan([], dialog.tags(), files)
+        self.start_scan([], dialog.tags(), files, tag_new_only=dialog.new_only())
 
     def rescan_all(self):
         directories = self._directories()
@@ -651,7 +658,8 @@ class VideoTagApp(QMainWindow):
         else:
             self.choose_directory()
 
-    def start_scan(self, directories: list[str], tags: list[str] | None = None, files: list[str] | None = None):
+    def start_scan(self, directories: list[str], tags: list[str] | None = None, files: list[str] | None = None,
+                   tag_new_only: bool = False):
         if self.scanning:
             return
         self.scanning = True
@@ -663,7 +671,7 @@ class VideoTagApp(QMainWindow):
         self.progress_bar.show()
         self.statusBar().showMessage("ファイルを検索中...")
 
-        self.scan_worker = ScanWorker(directories, tags, files, parent=self)
+        self.scan_worker = ScanWorker(directories, tags, files, tag_new_only, parent=self)
         self.scan_worker.progress.connect(self.on_scan_progress)
         self.scan_worker.scan_finished.connect(self.on_scan_finished)
         self.scan_worker.start()
@@ -701,6 +709,15 @@ class VideoTagApp(QMainWindow):
         super().closeEvent(event)
 
     # ---------------------------------------------------------------- 補助
+    def _ask_add_tags(self, title: str, target: str) -> AddTagsDialog | None:
+        """追加時に付けるタグを入力させる（キャンセル時は None）"""
+        new_only = self.settings.value("add/tag_new_only", False, type=bool)
+        dialog = AddTagsDialog(title, target, self.completer_model, new_only, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return None
+        self.settings.setValue("add/tag_new_only", dialog.new_only())
+        return dialog
+
     def _panel_header(self, title: str, toggle: QPushButton) -> QHBoxLayout:
         """パネル見出し（右端の「－」で最小化）"""
         minimize_button = QToolButton()

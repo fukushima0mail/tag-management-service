@@ -27,10 +27,11 @@ class ScanWorker(QThread):
     scan_finished = pyqtSignal(int, int, int)  # 追加, 更新, 削除
 
     def __init__(self, directories: list[str], tags: list[str] | None = None,
-                 files: list[str] | None = None, parent=None):
+                 files: list[str] | None = None, tag_new_only: bool = False, parent=None):
         super().__init__(parent)
         self.directories = [os.path.normpath(d) for d in directories]
-        self.tags = tags or []  # スキャン対象のすべてのファイルに付与するタグ
+        self.tags = tags or []  # スキャン対象のファイルに付与するタグ
+        self.tag_new_only = tag_new_only  # True なら、スキャン開始時点で未登録のファイルにだけタグを付与
         self.files = [os.path.normpath(f) for f in files or []]  # 個別に追加するファイル
 
     def run(self):
@@ -59,13 +60,15 @@ class ScanWorker(QThread):
             # サイズ・更新日時が変わっていないファイルは再処理しない
             existing = index.get(path)
             if existing and existing[1] == stat.st_size and existing[2] == stat.st_mtime:
-                scanned_ids.append(existing[0])
+                if not self.tag_new_only:
+                    scanned_ids.append(existing[0])
                 continue
 
             media_type, duration, thumbnail = load_media_info(path)
             video_id = add_video(path, media_type, duration, thumbnail, stat.st_size, stat.st_mtime)
             add_tag([video_id], extension_tag(path))
-            scanned_ids.append(video_id)
+            if not (existing and self.tag_new_only):
+                scanned_ids.append(video_id)
             if existing:
                 updated += 1
             else:
