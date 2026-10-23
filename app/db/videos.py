@@ -1,11 +1,6 @@
-from PIL import Image
-import os
-import io
-
-import ffmpeg
-from sqlite3 import Binary, IntegrityError
-
 from db.connection import DBConnection
+from db.tags import delete_unused_tags, get_tags_by_video
+
 
 def create_videos_table():
     with DBConnection() as c:
@@ -15,67 +10,93 @@ def create_videos_table():
                 file_path TEXT UNIQUE NOT NULL,
                 duration REAL,
                 thumbnail BLOB,
-                added_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                added_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                media_type TEXT NOT NULL DEFAULT 'video',
+                file_size INTEGER,
+                modified_at REAL
             )
         """)
 
-def add_video(file_path: str):
-    """動画をデータベースに追加（再生時間は自動取得）"""
-    if not os.path.exists(file_path):
-        print(f"エラー: ファイルが見つかりません ({file_path})")
+        # 既存DBに不足しているカラムを追加
+        c.execute("PRAGMA table_info(videos)")
+        columns = {row[1] for row in c.fetchall()}
+        for name, definition in (
+            ("media_type", "TEXT NOT NULL DEFAULT 'video'"),
+            ("file_size", "INTEGER"),
+            ("modified_at", "REAL"),
+        ):
+            if name not in columns:
+                c.execute(f"ALTER TABLE videos ADD COLUMN {name} {definition}")
+
+
+def add_video(file_path: str, media_type: str, duration: float | None, thumbnail: bytes | None,
+              file_size: int, modified_at: float) -> int:
+    """動画・画像を登録（登録済みなら更新）し、IDを返す"""
+    with DBConnection() as c:
+        c.execute("""
+            INSERT INTO videos (file_path, media_type, duration, thumbnail, file_size, modified_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(file_path) DO UPDATE SET
+                media_type = excluded.media_type,
+                duration = excluded.duration,
+                thumbnail = excluded.thumbnail,
+                file_size = excluded.file_size,
+                modified_at = excluded.modified_at
+            RETURNING id
+        """, (file_path, media_type, duration, thumbnail, file_size, modified_at))
+        return c.fetchone()[0]
+
+
+def delete_videos(video_ids: list[int]):
+    if not video_ids:
         return
-
-    duration = get_video_duration(file_path)
-    thumbnail = generate_thumbnail(file_path)
     with DBConnection() as c:
-        try:
-            c.execute("""
-                INSERT INTO videos (file_path, duration, thumbnail) 
-                VALUES (?, ?, ?)
-            """, (file_path, duration, Binary(thumbnail)))
-        except IntegrityError:
-            print(f"既に登録されている動画です: {file_path}")
+        c.executemany("DELETE FROM videos WHERE id = ?", [(v,) for v in video_ids])
+        delete_unused_tags(c)
 
-def get_all_videos():
-    """登録されているすべての動画を取得"""
+
+def get_video_index() -> dict[str, tuple[int, int | None, float | None]]:
+    """file_path -> (id, file_size, modified_at)"""
     with DBConnection() as c:
-        c.execute("SELECT id, file_path, duration, thumbnail, added_at FROM videos")
-        data = c.fetchall()
+        c.execute("SELECT id, file_path, file_size, modified_at FROM videos")
+        return {path: (video_id, size, mtime) for video_id, path, size, mtime in c.fetchall()}
 
-    print(f"Fetched {len(data)} videos from DB")
 
-    result = []
-    for video_id, file_path, duration, thumbnail, added_at in data:
-        try:
-            thumbnail_img = Image.open(io.BytesIO(thumbnail)) if thumbnail else None
-        except Exception as e:
-            print(f"エラー: サムネイルの読み込みに失敗 ({file_path})\n{e}")
-            thumbnail_img = None  # サムネイルが壊れている場合は None にする
+def get_all_videos() -> list[dict]:
+    """登録されているすべての動画・画像をタグ付きで取得（サムネイルは含まない）"""
+    with DBConnection() as c:
+        c.execute("""
+            SELECT id, file_path, media_type, duration, file_size, modified_at, added_at
+            FROM videos
+        """)
+        rows = c.fetchall()
 
-        result.append((video_id, file_path, duration, thumbnail_img, added_at))
+    tags = get_tags_by_video()
+    return [
+        {
+            "id": video_id,
+            "file_path": file_path,
+            "media_type": media_type,
+            "duration": duration,
+            "file_size": file_size,
+            "modified_at": modified_at,
+            "added_at": added_at,
+            "tags": tags.get(video_id, []),
+        }
+        for video_id, file_path, media_type, duration, file_size, modified_at, added_at in rows
+    ]
 
+
+def get_thumbnails(video_ids: list[int]) -> dict[int, bytes]:
+    """video_id -> サムネイルJPEG"""
+    result = {}
+    with DBConnection() as c:
+        for i in range(0, len(video_ids), 500):
+            chunk = video_ids[i:i + 500]
+            placeholders = ",".join("?" * len(chunk))
+            c.execute(
+                f"SELECT id, thumbnail FROM videos WHERE id IN ({placeholders}) AND thumbnail IS NOT NULL",
+                chunk,
+            )
+            result.update(c.fetchall())
     return result
-
-def get_video_duration(file_path: str) -> float:
-    """動画ファイルの再生時間を取得（秒単位）"""
-    try:
-        probe = ffmpeg.probe(file_path)
-        duration = float(probe['format']['duration'])
-        return duration
-    except Exception as e:
-        print(f"エラー: 動画の再生時間を取得できませんでした ({file_path})\n{e}")
-        return 0.0
-
-def generate_thumbnail(file_path: str) -> bytes:
-    """ffmpegを使って動画のサムネイルを取得し、バイナリデータとして返す"""
-    try:
-        out, _ = (
-            ffmpeg
-            .input(file_path, ss=5)  # 5秒地点のフレームを取得
-            .output("pipe:", vframes=1, format="image2", vcodec="mjpeg")
-            .run(capture_stdout=True, capture_stderr=True)
-        )
-        return out  # JPEGのバイナリデータ
-    except Exception as e:
-        print(f"サムネイル生成エラー: {e}")
-        return None
