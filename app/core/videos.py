@@ -58,6 +58,12 @@ class ThumbnailGrid(QListWidget):
         self.setMovement(QListWidget.Movement.Static)
         self.setUniformItemSizes(True)
         self.setWordWrap(True)
+        self.show_labels = True
+        self._fit_cells()
+
+    def set_show_labels(self, show: bool):
+        """ファイル名を非表示にした場合は、その分セルの高さを詰める"""
+        self.show_labels = show
         self._fit_cells()
 
     def resizeEvent(self, event):
@@ -71,9 +77,10 @@ class ThumbnailGrid(QListWidget):
         columns = max(1, min(MAX_COLUMNS, width // MIN_CELL_WIDTH))
         cell_width = width // columns
         icon = QSize(cell_width - CELL_PADDING, (cell_width - CELL_PADDING) * 9 // 16)
-        if icon != self.iconSize():
+        grid = QSize(cell_width, icon.height() + (LABEL_HEIGHT if self.show_labels else CELL_PADDING))
+        if icon != self.iconSize() or grid != self.gridSize():
             self.setIconSize(icon)
-            self.setGridSize(QSize(cell_width, icon.height() + LABEL_HEIGHT))
+            self.setGridSize(grid)
 
 
 class AddTagsDialog(QDialog):
@@ -160,6 +167,7 @@ class VideoTagApp(QMainWindow):
         self.search_edit = QLineEdit()
         self.search_edit.setPlaceholderText("ファイル名で検索")
         self.search_edit.setClearButtonEnabled(True)
+        self.search_edit.setMinimumWidth(160)
         self.search_edit.textChanged.connect(self.apply_filters)
 
         self.type_combo = QComboBox()
@@ -173,25 +181,37 @@ class VideoTagApp(QMainWindow):
         self.order_combo.addItems(["昇順", "降順"])
         self.order_combo.currentIndexChanged.connect(self.apply_filters)
 
-        top = QHBoxLayout()
-        top.addWidget(self.add_dir_button)
-        top.addWidget(self.add_files_button)
-        top.addWidget(self.rescan_button)
-        top.addWidget(self.exclude_dir_button)
-        top.addSpacing(16)
-        top.addWidget(self.search_edit, 1)
-        top.addWidget(QLabel("種類:"))
-        top.addWidget(self.type_combo)
-        top.addWidget(QLabel("並び替え:"))
-        top.addWidget(self.sort_combo)
-        top.addWidget(self.order_combo)
-
-        # 左右パネルの表示切り替え（最小化したパネルはここから再表示）
+        # 1段目: ファイル操作・表示切り替え
+        # （最小化したパネルは「絞り込み」「ファイル情報」から再表示）
         self.filter_toggle = QPushButton("絞り込み")
         self.detail_toggle = QPushButton("ファイル情報")
-        top.addSpacing(16)
-        top.addWidget(self.filter_toggle)
-        top.addWidget(self.detail_toggle)
+        self.label_toggle = QPushButton("ファイル名")
+        self.label_toggle.setCheckable(True)
+        self.label_toggle.setToolTip("サムネイル一覧のファイル名表示を切り替え")
+
+        operation_row = QHBoxLayout()
+        operation_row.addWidget(self.add_dir_button)
+        operation_row.addWidget(self.add_files_button)
+        operation_row.addWidget(self.rescan_button)
+        operation_row.addWidget(self.exclude_dir_button)
+        operation_row.addStretch(1)
+        operation_row.addWidget(QLabel("表示:"))
+        operation_row.addWidget(self.filter_toggle)
+        operation_row.addWidget(self.detail_toggle)
+        operation_row.addWidget(self.label_toggle)
+
+        # 2段目: 検索・種類・並び替え
+        search_row = QHBoxLayout()
+        search_row.addWidget(self.search_edit, 1)
+        search_row.addWidget(QLabel("種類:"))
+        search_row.addWidget(self.type_combo)
+        search_row.addWidget(QLabel("並び替え:"))
+        search_row.addWidget(self.sort_combo)
+        search_row.addWidget(self.order_combo)
+
+        top = QVBoxLayout()
+        top.addLayout(operation_row)
+        top.addLayout(search_row)
 
         # 左: タグフィルター
         self.tag_filter_list = QListWidget()
@@ -290,6 +310,10 @@ class VideoTagApp(QMainWindow):
         splitter.setStretchFactor(1, 1)
         splitter.setSizes([200, 720, 280])
 
+        self.label_toggle.setChecked(self.settings.value("grid/show_labels", True, type=bool))
+        self.grid.set_show_labels(self.label_toggle.isChecked())
+        self.label_toggle.toggled.connect(self.set_show_labels)
+
         for toggle, panel, key in ((self.filter_toggle, left, "filter"), (self.detail_toggle, right, "detail")):
             toggle.setCheckable(True)
             toggle.toggled.connect(panel.setVisible)
@@ -371,7 +395,7 @@ class VideoTagApp(QMainWindow):
         for video in result:
             item = QListWidgetItem(
                 self.icons.get(video["id"], self.placeholder_icon),
-                os.path.basename(video["file_path"]),
+                os.path.basename(video["file_path"]) if self.grid.show_labels else "",
             )
             item.setData(Qt.ItemDataRole.UserRole, video["id"])
             item.setToolTip(
@@ -437,6 +461,11 @@ class VideoTagApp(QMainWindow):
         add_tag(ids, name)
         self.tag_input.clear()
         self.reload_from_db()
+
+    def set_show_labels(self, show: bool):
+        self.settings.setValue("grid/show_labels", show)
+        self.grid.set_show_labels(show)
+        self.apply_filters()
 
     def set_rating_to_selection(self, rating: int):
         ids = self._selected_ids()
