@@ -40,9 +40,12 @@ def get_media_type(file_path: str) -> str | None:
     return None
 
 
+EXTENSION_TAG_GROUP = "拡張子"
+
+
 def extension_tag(file_path: str) -> str:
-    """自動付与する拡張子タグ（例: mp4）"""
-    return os.path.splitext(file_path)[1].lstrip(".").lower()
+    """自動付与する拡張子タグ（例: 拡張子:mp4）"""
+    return f"{EXTENSION_TAG_GROUP}:{os.path.splitext(file_path)[1].lstrip('.').lower()}"
 
 
 def is_same_or_under(path: str, directory: str) -> bool:

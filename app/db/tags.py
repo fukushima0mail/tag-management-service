@@ -1,3 +1,4 @@
+import os
 from collections import defaultdict
 
 from .connection import DBConnection
@@ -43,6 +44,55 @@ def remove_tag(video_ids: list[int], name: str):
             [(video_id, name) for video_id in video_ids],
         )
         delete_unused_tags(c)
+
+def rename_tags(renames: dict[str, str]):
+    """タグ名を一括変更（変更先のタグが既にある場合は統合する）"""
+    with DBConnection() as c:
+        for old, new in renames.items():
+            if old == new:
+                continue
+            c.execute("SELECT id FROM tags WHERE name = ?", (old,))
+            row = c.fetchone()
+            if row is None:
+                continue
+            old_id = row[0]
+            c.execute("SELECT id FROM tags WHERE name = ?", (new,))
+            row = c.fetchone()
+            if row is None:
+                c.execute("UPDATE tags SET name = ? WHERE id = ?", (new, old_id))
+            else:
+                c.execute(
+                    "INSERT OR IGNORE INTO video_tags (video_id, tag_id) SELECT video_id, ? FROM video_tags WHERE tag_id = ?",
+                    (row[0], old_id),
+                )
+                c.execute("DELETE FROM tags WHERE id = ?", (old_id,))  # video_tags は ON DELETE CASCADE で削除
+
+def migrate_extension_tags(extension_tag):
+    """旧形式の拡張子タグ（例: jpg）を新形式（例: 拡張子:jpg）に置き換える
+
+    ファイル自身の拡張子と同じ名前のタグだけを対象にする（何度実行しても結果は同じ）
+    """
+    with DBConnection() as c:
+        c.execute("""
+            SELECT v.id, v.file_path, t.id, t.name
+            FROM videos v
+            JOIN video_tags vt ON vt.video_id = v.id
+            JOIN tags t ON t.id = vt.tag_id
+        """)
+        targets = [
+            (video_id, tag_id, extension_tag(path))
+            for video_id, path, tag_id, name in c.fetchall()
+            if "." + name.lower() == os.path.splitext(path)[1].lower()
+        ]
+        for video_id, tag_id, new_name in targets:
+            c.execute("INSERT OR IGNORE INTO tags (name) VALUES (?)", (new_name,))
+            c.execute(
+                "INSERT OR IGNORE INTO video_tags (video_id, tag_id) SELECT ?, id FROM tags WHERE name = ?",
+                (video_id, new_name),
+            )
+            c.execute("DELETE FROM video_tags WHERE video_id = ? AND tag_id = ?", (video_id, tag_id))
+        delete_unused_tags(c)
+    return len(targets)
 
 def delete_unused_tags(c):
     """どの動画にも付いていないタグを削除"""

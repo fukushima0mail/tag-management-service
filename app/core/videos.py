@@ -13,13 +13,13 @@ from PyQt6.QtWidgets import (
     QCheckBox, QComboBox, QCompleter, QDialog, QDialogButtonBox, QFileDialog, QHBoxLayout, QInputDialog, QLabel,
     QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox, QProgressBar,
     QPushButton, QSplitter, QStyle, QStyledItemDelegate, QStyleOptionViewItem, QToolButton,
-    QVBoxLayout, QWidget,
+    QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
 from core.media import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, get_media_type, is_same_or_under
 from core.scanner import ScanWorker
 from db.exclusions import add_excluded_paths, get_excluded_paths, remove_excluded_paths
-from db.tags import add_tag, remove_tag
+from db.tags import add_tag, remove_tag, rename_tags
 from db.videos import delete_videos, get_all_videos, get_thumbnails, rename_video, set_rating
 
 MAX_COLUMNS = 8         # 1行に並べるサムネイルの最大数
@@ -41,6 +41,7 @@ TYPE_LABELS = {"video": "動画", "image": "画像"}
 MAX_RATING = 10
 INVALID_FILENAME_CHARS = '\\/:*?"<>|'
 RATING_ROLE = Qt.ItemDataRole.UserRole + 1  # サムネイル一覧の各項目に持たせる評価
+GROUP_ROLE = Qt.ItemDataRole.UserRole + 2   # タグ絞り込みツリーのグループ見出しに持たせるグループ名
 STAR_FILLED_COLOR = QColor("#FFC107")
 STAR_EMPTY_COLOR = QColor(255, 255, 255, 110)
 
@@ -86,9 +87,23 @@ class RatingDelegate(QStyledItemDelegate):
         painter.restore()
 
 
+def normalize_tag(name: str) -> str:
+    """「年代：2020」「年代 : 2020」などを「年代:2020」に揃える"""
+    group, value = split_tag(name.replace("：", ":"))
+    return f"{group}:{value}" if group else value
+
+
+def split_tag(name: str) -> tuple[str | None, str]:
+    """「グループ:値」形式のタグを (グループ, 値) に分解（グループなしは (None, タグ名)）"""
+    group, sep, value = name.partition(":")
+    if sep and group.strip() and value.strip():
+        return group.strip(), value.strip()
+    return None, name.strip()
+
+
 def parse_tags(text: str) -> list[str]:
     """カンマ（, 、）区切りのタグ入力を分解"""
-    names = (t.strip() for t in text.replace("、", ",").split(","))
+    names = (normalize_tag(t) for t in text.replace("、", ",").split(","))
     return list(dict.fromkeys(t for t in names if t))
 
 
@@ -265,8 +280,13 @@ class VideoTagApp(QMainWindow):
         top.addLayout(search_row)
 
         # 左: タグフィルター
-        self.tag_filter_list = QListWidget()
+        self.tag_filter_list = QTreeWidget()
+        self.tag_filter_list.setHeaderHidden(True)
         self.tag_filter_list.itemChanged.connect(self.apply_filters)
+        self.tag_filter_list.itemExpanded.connect(self.on_tag_group_toggled)
+        self.tag_filter_list.itemCollapsed.connect(self.on_tag_group_toggled)
+        self.tag_filter_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.tag_filter_list.customContextMenuRequested.connect(self.show_tag_menu)
         self.tag_mode_combo = QComboBox()
         self.tag_mode_combo.addItems(["すべて含む (AND)", "いずれか含む (OR)"])
         self.tag_mode_combo.currentIndexChanged.connect(self.apply_filters)
@@ -407,18 +427,133 @@ class VideoTagApp(QMainWindow):
         self.apply_filters()
 
     def refresh_tag_filter(self):
+        """タグ絞り込みツリーを再構築（「グループ:値」形式のタグはグループの下にまとめる）"""
         checked = self._checked_filter_tags()
         counts = Counter(t for v in self.videos for t in v["tags"])
+        groups: dict[str, list[str]] = {}
+        ungrouped = []
+        for name in counts:
+            group, _ = split_tag(name)
+            if group:
+                groups.setdefault(group, []).append(name)
+            else:
+                ungrouped.append(name)
+
+        def add_tag_item(parent, name: str, text: str):
+            item = QTreeWidgetItem(parent, [f"{text} ({counts[name]})"])
+            item.setData(0, Qt.ItemDataRole.UserRole, name)
+            item.setToolTip(0, name)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(0, Qt.CheckState.Checked if name in checked else Qt.CheckState.Unchecked)
 
         self.tag_filter_list.blockSignals(True)
         self.tag_filter_list.clear()
-        for name in sorted(counts, key=str.lower):
-            item = QListWidgetItem(f"{name} ({counts[name]})")
-            item.setData(Qt.ItemDataRole.UserRole, name)
-            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-            item.setCheckState(Qt.CheckState.Checked if name in checked else Qt.CheckState.Unchecked)
-            self.tag_filter_list.addItem(item)
+        for group in sorted(groups, key=str.lower):
+            names = groups[group]
+            # グループの件数は、グループ内のいずれかのタグが付いたファイル数
+            total = sum(1 for v in self.videos if any(t in names for t in v["tags"]))
+            group_item = QTreeWidgetItem(self.tag_filter_list, [f"{group} ({total})"])
+            group_item.setData(0, GROUP_ROLE, group)
+            group_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            font = group_item.font(0)
+            font.setBold(True)
+            group_item.setFont(0, font)
+            for name in sorted(names, key=lambda n: split_tag(n)[1].lower()):
+                add_tag_item(group_item, name, split_tag(name)[1])
+            group_item.setExpanded(group not in self._collapsed_groups())
+        for name in sorted(ungrouped, key=str.lower):
+            add_tag_item(self.tag_filter_list, name, name)
         self.tag_filter_list.blockSignals(False)
+
+    def show_tag_menu(self, pos):
+        """タグ絞り込みツリーの右クリックメニュー"""
+        item = self.tag_filter_list.itemAt(pos)
+        if item is None:
+            return
+        menu = QMenu(self)
+        group = item.data(0, GROUP_ROLE)
+        if group is None:
+            name = item.data(0, Qt.ItemDataRole.UserRole)
+            menu.addAction("タグ名を変更...", lambda: self.rename_tag(name))
+        else:
+            menu.addAction("グループ名を変更...", lambda: self.rename_group(group))
+            menu.addAction("グループを解除", lambda: self.ungroup(group))
+        menu.exec(self.tag_filter_list.viewport().mapToGlobal(pos))
+
+    def rename_tag(self, name: str):
+        new_name, ok = QInputDialog.getText(
+            self, "タグ名を変更",
+            f"「{name}」の新しい名前\n（「グループ:値」の形にするとグループに入ります）",
+            text=name,
+        )
+        new_name = normalize_tag(new_name)
+        if ok and new_name and new_name != name:
+            self._rename_tags({name: new_name})
+
+    def rename_group(self, group: str):
+        new_group, ok = QInputDialog.getText(self, "グループ名を変更", f"「{group}」の新しいグループ名", text=group)
+        new_group = new_group.replace("：", ":").strip()
+        if not ok or not new_group or new_group == group:
+            return
+        if ":" in new_group:
+            QMessageBox.warning(self, "グループ名を変更", "グループ名に「:」は使えません")
+            return
+        names = self._group_tags(group)
+        if self._rename_tags({n: f"{new_group}:{split_tag(n)[1]}" for n in names}):
+            collapsed = self._collapsed_groups()
+            if group in collapsed:
+                collapsed.discard(group)
+                collapsed.add(new_group)
+                self.settings.setValue("filter/collapsed_groups", sorted(collapsed))
+                self.refresh_tag_filter()
+
+    def ungroup(self, group: str):
+        names = self._group_tags(group)
+        answer = QMessageBox.question(
+            self, "グループを解除",
+            f"グループ「{group}」を解除しますか？\n（例: {names[0]} → {split_tag(names[0])[1]}）",
+        )
+        if answer == QMessageBox.StandardButton.Yes:
+            self._rename_tags({n: split_tag(n)[1] for n in names})
+
+    def _rename_tags(self, renames: dict[str, str]) -> bool:
+        """タグ名を一括変更し、絞り込みのチェック状態も引き継ぐ（キャンセル時は False）"""
+        existing = {t for v in self.videos for t in v["tags"]}
+        merged = sorted(new for old, new in renames.items() if new in existing and new != old)
+        if merged:
+            answer = QMessageBox.question(
+                self, "タグを統合",
+                "次のタグは既にあるため、統合されます。よろしいですか？\n" + "\n".join(merged),
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return False
+
+        checked = {renames.get(t, t) for t in self._checked_filter_tags()}
+        rename_tags(renames)
+        self.reload_from_db()
+        self.tag_filter_list.blockSignals(True)
+        for item in self._filter_tag_items():
+            if item.data(0, Qt.ItemDataRole.UserRole) in checked:
+                item.setCheckState(0, Qt.CheckState.Checked)
+        self.tag_filter_list.blockSignals(False)
+        self.apply_filters()
+        self.statusBar().showMessage(f"{len(renames)} 個のタグ名を変更しました", 10000)
+        return True
+
+    def _group_tags(self, group: str) -> list[str]:
+        """グループに属するタグ名の一覧"""
+        return sorted({t for v in self.videos for t in v["tags"] if split_tag(t)[0] == group})
+
+    def on_tag_group_toggled(self, item: QTreeWidgetItem):
+        group = item.data(0, GROUP_ROLE)
+        if group is None:
+            return
+        collapsed = self._collapsed_groups()
+        if item.isExpanded():
+            collapsed.discard(group)
+        else:
+            collapsed.add(group)
+        self.settings.setValue("filter/collapsed_groups", sorted(collapsed))
 
     def apply_filters(self):
         """検索・種類・タグで絞り込み、並び替えて一覧を再描画"""
@@ -478,7 +613,8 @@ class VideoTagApp(QMainWindow):
         self.rename_button.setEnabled(len(videos) == 1 and not self.scanning)
 
         ratings = {v["rating"] or 0 for v in videos}
-        self.rating_combo.setCurrentIndex(ratings.pop() if len(ratings) == 1 else -1)
+        # 未選択時は「未評価」、評価が混在する場合は空欄（「（混在）」と表示）
+        self.rating_combo.setCurrentIndex(ratings.pop() if len(ratings) == 1 else -1 if ratings else 0)
 
         self.detail_tags.clear()
         if not videos:
@@ -509,7 +645,7 @@ class VideoTagApp(QMainWindow):
 
     # ---------------------------------------------------------------- 操作
     def add_tag_to_selection(self):
-        name = self.tag_input.text().strip()
+        name = normalize_tag(self.tag_input.text())
         ids = self._selected_ids()
         if not name or not ids:
             return
@@ -661,8 +797,8 @@ class VideoTagApp(QMainWindow):
 
     def clear_tag_filter(self):
         self.tag_filter_list.blockSignals(True)
-        for i in range(self.tag_filter_list.count()):
-            self.tag_filter_list.item(i).setCheckState(Qt.CheckState.Unchecked)
+        for item in self._filter_tag_items():
+            item.setCheckState(0, Qt.CheckState.Unchecked)
         self.tag_filter_list.blockSignals(False)
         self.apply_filters()
 
@@ -809,12 +945,24 @@ class VideoTagApp(QMainWindow):
     def _selected_ids(self) -> list[int]:
         return [item.data(Qt.ItemDataRole.UserRole) for item in self.grid.selectedItems()]
 
+    def _filter_tag_items(self):
+        """タグ絞り込みツリーのタグ項目（グループ見出しを除く）を列挙"""
+        for i in range(self.tag_filter_list.topLevelItemCount()):
+            top = self.tag_filter_list.topLevelItem(i)
+            if top.data(0, GROUP_ROLE) is None:
+                yield top
+            else:
+                yield from (top.child(j) for j in range(top.childCount()))
+
     def _checked_filter_tags(self) -> set[str]:
         return {
-            self.tag_filter_list.item(i).data(Qt.ItemDataRole.UserRole)
-            for i in range(self.tag_filter_list.count())
-            if self.tag_filter_list.item(i).checkState() == Qt.CheckState.Checked
+            item.data(0, Qt.ItemDataRole.UserRole)
+            for item in self._filter_tag_items()
+            if item.checkState(0) == Qt.CheckState.Checked
         }
+
+    def _collapsed_groups(self) -> set[str]:
+        return set(self.settings.value("filter/collapsed_groups", [], type=list))
 
     def _directories(self) -> list[str]:
         return self.settings.value("directories", [], type=list)
