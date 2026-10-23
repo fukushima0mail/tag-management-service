@@ -7,7 +7,8 @@ from urllib.parse import quote_plus
 
 from PyQt6.QtCore import QFile, QRect, QSettings, QSize, QStringListModel, Qt, QUrl
 from PyQt6.QtGui import (
-    QColor, QDesktopServices, QFont, QFontMetrics, QIcon, QKeySequence, QPixmap, QShortcut,
+    QColor, QDesktopServices, QFont, QFontMetrics, QIcon, QKeySequence, QPainter, QPalette, QPen,
+    QPixmap, QShortcut,
 )
 from PyQt6.QtWidgets import (
     QCheckBox, QComboBox, QCompleter, QDialog, QDialogButtonBox, QFileDialog, QHBoxLayout, QInputDialog, QLabel,
@@ -44,6 +45,7 @@ RATING_ROLE = Qt.ItemDataRole.UserRole + 1  # サムネイル一覧の各項目�
 GROUP_ROLE = Qt.ItemDataRole.UserRole + 2   # タグ絞り込みツリーのグループ見出しに持たせるグループ名
 STAR_FILLED_COLOR = QColor("#FFC107")
 STAR_EMPTY_COLOR = QColor(255, 255, 255, 110)
+SELECTION_BORDER_WIDTH = 4
 
 
 def rating_stars(rating: int) -> str:
@@ -54,20 +56,33 @@ def format_rating(rating: int | None) -> str:
     return f"{rating_stars(rating)} ({rating}/{MAX_RATING})" if rating else "未評価"
 
 
-class RatingDelegate(QStyledItemDelegate):
-    """サムネイルの下端に評価の★を重ねて描画する（未評価は何も描かない）"""
+class ThumbnailDelegate(QStyledItemDelegate):
+    """サムネイルの描画: 選択中の強調表示と、評価の★を重ねて描く"""
 
     def paint(self, painter, option, index):
-        super().paint(painter, option, index)
-        rating = index.data(RATING_ROLE)
-        if not rating:
-            return
-
         opt = QStyleOptionViewItem(option)
         self.initStyleOption(opt, index)
-        widget = opt.widget
-        icon_rect = widget.style().subElementRect(QStyle.SubElement.SE_ItemViewItemDecoration, opt, widget)
+        selected = bool(opt.state & QStyle.StateFlag.State_Selected)
+        accent = opt.palette.color(QPalette.ColorGroup.Active, QPalette.ColorRole.Highlight)
+        style = opt.widget.style()
+        if selected and opt.text:
+            # ファイル名の背景を薄くアクセント色にする（標準の選択表示は薄すぎるので使わない）
+            text_rect = style.subElementRect(QStyle.SubElement.SE_ItemViewItemText, opt, opt.widget)
+            painter.fillRect(text_rect, QColor(accent.red(), accent.green(), accent.blue(), 70))
+        base = QStyleOptionViewItem(option)
+        base.state &= ~QStyle.StateFlag.State_Selected
+        super().paint(painter, base, index)
 
+        icon_rect = style.subElementRect(QStyle.SubElement.SE_ItemViewItemDecoration, opt, opt.widget)
+        rating = index.data(RATING_ROLE)
+        if rating:
+            self._paint_rating(painter, opt, icon_rect, rating)
+        if selected:
+            self._paint_selection(painter, icon_rect, accent)
+
+    @staticmethod
+    def _paint_rating(painter, opt, icon_rect: QRect, rating: int):
+        """サムネイルの下端に評価の★を重ねて描画する"""
         painter.save()
         font = QFont(opt.font)
         # 10個の★がサムネイル幅に収まる大きさにする
@@ -84,6 +99,31 @@ class RatingDelegate(QStyledItemDelegate):
         painter.drawText(x, baseline, filled)
         painter.setPen(STAR_EMPTY_COLOR)
         painter.drawText(x + metrics.horizontalAdvance(filled), baseline, empty)
+        painter.restore()
+
+    @staticmethod
+    def _paint_selection(painter, icon_rect: QRect, accent: QColor):
+        """選択中のサムネイルに太枠と右上のチェックマークを描画する"""
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        pen = QPen(accent, SELECTION_BORDER_WIDTH)
+        pen.setJoinStyle(Qt.PenJoinStyle.MiterJoin)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        # 枠はサムネイルの内側に描く（一覧の端で切れないように）
+        half = SELECTION_BORDER_WIDTH // 2
+        painter.drawRect(icon_rect.adjusted(half, half, -half, -half))
+
+        size = max(16, icon_rect.width() // 7)
+        badge = QRect(icon_rect.right() - size - 3, icon_rect.top() + 3, size, size)
+        painter.setPen(QPen(Qt.GlobalColor.white, 2))
+        painter.setBrush(accent)
+        painter.drawEllipse(badge)
+        font = painter.font()
+        font.setPixelSize(int(size * 0.7))
+        font.setBold(True)
+        painter.setFont(font)
+        painter.drawText(badge, Qt.AlignmentFlag.AlignCenter, "✓")
         painter.restore()
 
 
@@ -303,7 +343,7 @@ class VideoTagApp(QMainWindow):
 
         # 中央: サムネイル一覧
         self.grid = ThumbnailGrid()
-        self.grid.setItemDelegate(RatingDelegate(self.grid))
+        self.grid.setItemDelegate(ThumbnailDelegate(self.grid))
         self.grid.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
         self.grid.itemSelectionChanged.connect(self.update_detail)
         self.grid.itemDoubleClicked.connect(
