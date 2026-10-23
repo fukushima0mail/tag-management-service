@@ -26,14 +26,16 @@ class ScanWorker(QThread):
     progress = pyqtSignal(int, int, str)       # 処理済み件数, 総件数, ファイルパス
     scan_finished = pyqtSignal(int, int, int)  # 追加, 更新, 削除
 
-    def __init__(self, directories: list[str], tags: list[str] | None = None, parent=None):
+    def __init__(self, directories: list[str], tags: list[str] | None = None,
+                 files: list[str] | None = None, parent=None):
         super().__init__(parent)
         self.directories = [os.path.normpath(d) for d in directories]
         self.tags = tags or []  # スキャン対象のすべてのファイルに付与するタグ
+        self.files = [os.path.normpath(f) for f in files or []]  # 個別に追加するファイル
 
     def run(self):
         excluded = get_excluded_paths()
-        files = []
+        files = list(self.files)
         for directory in self.directories:
             # 明示的に追加したフォルダは、その上位フォルダの除外設定より優先する
             rules = {os.path.normcase(e) for e in excluded if not is_same_or_under(directory, e)}
@@ -73,11 +75,13 @@ class ScanWorker(QThread):
 
         # スキャン対象フォルダから消えたファイルをDBから削除
         # （フォルダ自体が見つからない場合は、外付けドライブ未接続などを考慮して削除しない）
+        # （除外フォルダ内から個別に追加したファイルは、スキャン対象外でも実在すれば残す）
         found = set(files)
         available = [d for d in self.directories if os.path.isdir(d)]
         stale = [
             video_id for path, (video_id, _, _) in index.items()
             if path not in found and any(is_same_or_under(path, d) for d in available)
+            and not os.path.exists(path)
         ]
         delete_videos(stale)
         self.scan_finished.emit(added, updated, len(stale))

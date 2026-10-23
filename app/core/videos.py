@@ -4,19 +4,19 @@ import sys
 from collections import Counter
 from datetime import datetime
 
-from PyQt6.QtCore import QSettings, QSize, QStringListModel, Qt
+from PyQt6.QtCore import QFile, QSettings, QSize, QStringListModel, Qt
 from PyQt6.QtGui import QIcon, QKeySequence, QPixmap, QShortcut
 from PyQt6.QtWidgets import (
-    QComboBox, QCompleter, QDialog, QDialogButtonBox, QFileDialog, QHBoxLayout, QLabel,
+    QComboBox, QCompleter, QDialog, QDialogButtonBox, QFileDialog, QHBoxLayout, QInputDialog, QLabel,
     QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QProgressBar,
     QPushButton, QSplitter, QStyle, QToolButton, QVBoxLayout, QWidget,
 )
 
-from core.media import is_same_or_under
+from core.media import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, get_media_type, is_same_or_under
 from core.scanner import ScanWorker
 from db.exclusions import add_excluded_paths, get_excluded_paths, remove_excluded_paths
 from db.tags import add_tag, remove_tag
-from db.videos import delete_videos, get_all_videos, get_thumbnails, set_rating
+from db.videos import delete_videos, get_all_videos, get_thumbnails, rename_video, set_rating
 
 MAX_COLUMNS = 8         # 1行に並べるサムネイルの最大数
 MIN_CELL_WIDTH = 140    # これより狭くなる場合は列数を減らす
@@ -35,6 +35,7 @@ SORT_KEYS = {
 TYPE_FILTERS = {"すべて": None, "動画": "video", "画像": "image"}
 TYPE_LABELS = {"video": "動画", "image": "画像"}
 MAX_RATING = 10
+INVALID_FILENAME_CHARS = '\\/:*?"<>|'
 
 
 def format_rating(rating: int | None) -> str:
@@ -75,12 +76,12 @@ class ThumbnailGrid(QListWidget):
             self.setGridSize(QSize(cell_width, icon.height() + LABEL_HEIGHT))
 
 
-class FolderTagDialog(QDialog):
-    """フォルダ追加時に、フォルダ内のすべてのファイルへ付けるタグを指定する"""
+class AddTagsDialog(QDialog):
+    """フォルダ・ファイル追加時に、追加するすべてのファイルへ付けるタグを指定する"""
 
-    def __init__(self, directory: str, completer_model: QStringListModel, parent=None):
+    def __init__(self, title: str, target: str, completer_model: QStringListModel, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("フォルダを追加")
+        self.setWindowTitle(title)
         self.resize(420, 0)
 
         self.tag_edit = QLineEdit()
@@ -94,11 +95,11 @@ class FolderTagDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
 
-        path_label = QLabel(directory)
-        path_label.setWordWrap(True)
+        target_label = QLabel(target)
+        target_label.setWordWrap(True)
         layout = QVBoxLayout(self)
-        layout.addWidget(path_label)
-        layout.addWidget(QLabel("フォルダ内のすべてのファイルに付けるタグ（カンマ区切り）"))
+        layout.addWidget(target_label)
+        layout.addWidget(QLabel("追加するすべてのファイルに付けるタグ（カンマ区切り）"))
         layout.addWidget(self.tag_edit)
         layout.addWidget(buttons)
 
@@ -153,6 +154,8 @@ class VideoTagApp(QMainWindow):
         self.rescan_button.clicked.connect(self.rescan_all)
         self.exclude_dir_button = QPushButton("フォルダを除外...")
         self.exclude_dir_button.clicked.connect(self.exclude_directory)
+        self.add_files_button = QPushButton("ファイルを追加...")
+        self.add_files_button.clicked.connect(self.choose_files)
 
         self.search_edit = QLineEdit()
         self.search_edit.setPlaceholderText("ファイル名で検索")
@@ -172,6 +175,7 @@ class VideoTagApp(QMainWindow):
 
         top = QHBoxLayout()
         top.addWidget(self.add_dir_button)
+        top.addWidget(self.add_files_button)
         top.addWidget(self.rescan_button)
         top.addWidget(self.exclude_dir_button)
         top.addSpacing(16)
@@ -216,6 +220,10 @@ class VideoTagApp(QMainWindow):
         delete_shortcut = QShortcut(QKeySequence.StandardKey.Delete, self.grid)
         delete_shortcut.setContext(Qt.ShortcutContext.WidgetShortcut)
         delete_shortcut.activated.connect(self.exclude_selection)
+        for key, slot in (("Shift+Delete", self.delete_selection), ("F2", self.rename_selection)):
+            shortcut = QShortcut(QKeySequence(key), self.grid)
+            shortcut.setContext(Qt.ShortcutContext.WidgetShortcut)
+            shortcut.activated.connect(slot)
 
         # 右: 詳細・タグ編集
         self.detail_label = QLabel()
@@ -253,6 +261,13 @@ class VideoTagApp(QMainWindow):
 
         self.exclude_button = QPushButton("選択したファイルをDBから除外 (Delete)")
         self.exclude_button.clicked.connect(self.exclude_selection)
+        self.rename_button = QPushButton("名前を変更 (F2)")
+        self.rename_button.clicked.connect(self.rename_selection)
+        self.delete_button = QPushButton("ファイルを削除 (Shift+Delete)")
+        self.delete_button.clicked.connect(self.delete_selection)
+        file_ops_row = QHBoxLayout()
+        file_ops_row.addWidget(self.rename_button)
+        file_ops_row.addWidget(self.delete_button)
 
         right_layout = QVBoxLayout()
         right_layout.addLayout(self._panel_header("ファイル情報", self.detail_toggle))
@@ -264,6 +279,7 @@ class VideoTagApp(QMainWindow):
         right_layout.addLayout(tag_input_row)
         right_layout.addSpacing(12)
         right_layout.addWidget(self.exclude_button)
+        right_layout.addLayout(file_ops_row)
         right = QWidget()
         right.setLayout(right_layout)
 
@@ -379,6 +395,8 @@ class VideoTagApp(QMainWindow):
         for widget in (self.tag_input, self.add_tag_button, self.remove_tag_button, self.rating_combo):
             widget.setEnabled(bool(videos))
         self.exclude_button.setEnabled(bool(videos) and not self.scanning)
+        self.delete_button.setEnabled(bool(videos) and not self.scanning)
+        self.rename_button.setEnabled(len(videos) == 1 and not self.scanning)
 
         ratings = {v["rating"] or 0 for v in videos}
         self.rating_combo.setCurrentIndex(ratings.pop() if len(ratings) == 1 else -1)
@@ -454,6 +472,78 @@ class VideoTagApp(QMainWindow):
         self.statusBar().showMessage(f"{len(videos)} 件をDBから除外しました", 10000)
         self.reload_from_db()
 
+    def rename_selection(self):
+        """選択中のファイル名を変更（実ファイルもリネームする）"""
+        videos = [self.video_by_id[i] for i in self._selected_ids()]
+        if len(videos) != 1 or self.scanning:
+            return
+        video = videos[0]
+        old_path = video["file_path"]
+        directory, old_name = os.path.split(old_path)
+        stem, ext = os.path.splitext(old_name)
+
+        stem, ok = QInputDialog.getText(
+            self, "名前を変更", f"新しいファイル名（拡張子 {ext} は変わりません）", text=stem,
+        )
+        stem = stem.strip()
+        if not ok or not stem or stem + ext == old_name:
+            return
+        if any(ch in INVALID_FILENAME_CHARS for ch in stem):
+            QMessageBox.warning(self, "名前を変更", f"ファイル名に次の文字は使えません:\n{INVALID_FILENAME_CHARS}")
+            return
+        new_path = os.path.join(directory, stem + ext)
+        # 大文字・小文字だけの変更は同じファイルとして扱う
+        if os.path.exists(new_path) and os.path.normcase(new_path) != os.path.normcase(old_path):
+            QMessageBox.warning(self, "名前を変更", f"同じ名前のファイルが既にあります:\n{new_path}")
+            return
+
+        try:
+            os.rename(old_path, new_path)
+        except OSError as e:
+            QMessageBox.warning(self, "名前を変更", f"名前を変更できませんでした:\n{e}")
+            return
+        try:
+            rename_video(video["id"], new_path)
+        except Exception as e:
+            os.rename(new_path, old_path)  # DBと実ファイルの名前がずれないよう元に戻す
+            QMessageBox.warning(self, "名前を変更", f"名前を変更できませんでした:\n{e}")
+            return
+        self.statusBar().showMessage(f"名前を変更しました: {old_name} → {stem + ext}", 10000)
+        self.reload_from_db()
+
+    def delete_selection(self):
+        """選択中のファイルをごみ箱へ移動し、DBからも削除する"""
+        videos = [self.video_by_id[i] for i in self._selected_ids()]
+        if not videos or self.scanning:
+            return
+        target = os.path.basename(videos[0]["file_path"]) if len(videos) == 1 else f"選択中の {len(videos)} 件"
+        answer = QMessageBox.warning(
+            self, "ファイルを削除",
+            f"{target}を削除しますか？\n"
+            "ファイルはごみ箱へ移動され、DBからも削除されます（付けたタグ・評価は失われます）。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+
+        deleted, failed = [], []
+        for video in videos:
+            path = video["file_path"]
+            # 既に実ファイルが無い場合はDBからの削除だけ行う
+            if not os.path.exists(path) or QFile.moveToTrash(path)[0]:
+                deleted.append(video["id"])
+            else:
+                failed.append(path)
+        delete_videos(deleted)
+        self.statusBar().showMessage(f"{len(deleted)} 件を削除しました", 10000)
+        if failed:
+            QMessageBox.warning(
+                self, "ファイルを削除",
+                "次のファイルは削除できませんでした（使用中の可能性があります）:\n" + "\n".join(failed),
+            )
+        self.reload_from_db()
+
     def exclude_directory(self):
         """選択したフォルダ内のファイルをすべてDBから除外（ファイル自体は削除しない）"""
         if self.scanning:
@@ -497,7 +587,7 @@ class VideoTagApp(QMainWindow):
         if not directory:
             return
         directory = os.path.normpath(directory)
-        dialog = FolderTagDialog(directory, self.completer_model, self)
+        dialog = AddTagsDialog("フォルダを追加", directory, self.completer_model, self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         directories = self._directories()
@@ -508,6 +598,23 @@ class VideoTagApp(QMainWindow):
         remove_excluded_paths([p for p in get_excluded_paths() if is_same_or_under(p, directory)])
         self.start_scan([directory], dialog.tags())
 
+    def choose_files(self):
+        patterns = " ".join(f"*{ext}" for ext in sorted(VIDEO_EXTENSIONS | IMAGE_EXTENSIONS))
+        files, _ = QFileDialog.getOpenFileNames(
+            self, "追加する動画・画像を選択", "", f"動画・画像 ({patterns});;すべてのファイル (*)",
+        )
+        files = [os.path.normpath(f) for f in files if get_media_type(f)]
+        if not files:
+            return
+        target = os.path.basename(files[0]) if len(files) == 1 else f"{len(files)} 件のファイル"
+        dialog = AddTagsDialog("ファイルを追加", target, self.completer_model, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        # 以前DBから除外したファイルでも、個別に追加した場合は再登録する
+        targets = {os.path.normcase(f) for f in files}
+        remove_excluded_paths([p for p in get_excluded_paths() if os.path.normcase(p) in targets])
+        self.start_scan([], dialog.tags(), files)
+
     def rescan_all(self):
         directories = self._directories()
         if directories:
@@ -515,10 +622,11 @@ class VideoTagApp(QMainWindow):
         else:
             self.choose_directory()
 
-    def start_scan(self, directories: list[str], tags: list[str] | None = None):
+    def start_scan(self, directories: list[str], tags: list[str] | None = None, files: list[str] | None = None):
         if self.scanning:
             return
         self.scanning = True
+        self.add_files_button.setEnabled(False)
         self.add_dir_button.setEnabled(False)
         self.rescan_button.setEnabled(False)
         self.exclude_dir_button.setEnabled(False)
@@ -526,7 +634,7 @@ class VideoTagApp(QMainWindow):
         self.progress_bar.show()
         self.statusBar().showMessage("ファイルを検索中...")
 
-        self.scan_worker = ScanWorker(directories, tags, self)
+        self.scan_worker = ScanWorker(directories, tags, files, parent=self)
         self.scan_worker.progress.connect(self.on_scan_progress)
         self.scan_worker.scan_finished.connect(self.on_scan_finished)
         self.scan_worker.start()
@@ -539,6 +647,7 @@ class VideoTagApp(QMainWindow):
 
     def on_scan_finished(self, added: int, updated: int, removed: int):
         self.scanning = False
+        self.add_files_button.setEnabled(True)
         self.add_dir_button.setEnabled(True)
         self.rescan_button.setEnabled(True)
         self.exclude_dir_button.setEnabled(True)

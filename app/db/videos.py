@@ -63,6 +63,11 @@ def set_rating(video_ids: list[int], rating: int):
         c.executemany("UPDATE videos SET rating = ? WHERE id = ?", [(rating, v) for v in video_ids])
 
 
+def rename_video(video_id: int, file_path: str):
+    with DBConnection() as c:
+        c.execute("UPDATE videos SET file_path = ? WHERE id = ?", (file_path, video_id))
+
+
 def get_video_index() -> dict[str, tuple[int, int | None, float | None]]:
     """file_path -> (id, file_size, modified_at)"""
     with DBConnection() as c:
