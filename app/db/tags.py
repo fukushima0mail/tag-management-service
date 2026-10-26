@@ -36,12 +36,12 @@ def add_tag(video_ids: list[int], name: str):
             [(video_id, tag_id) for video_id in video_ids],
         )
 
-def remove_tag(video_ids: list[int], name: str):
+def remove_tags(video_ids: list[int], names: list[str]):
     """指定した動画からタグを外す"""
     with DBConnection() as c:
         c.executemany(
             "DELETE FROM video_tags WHERE video_id = ? AND tag_id = (SELECT id FROM tags WHERE name = ?)",
-            [(video_id, name) for video_id in video_ids],
+            [(video_id, name) for video_id in video_ids for name in names],
         )
         delete_unused_tags(c)
 

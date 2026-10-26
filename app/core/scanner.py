@@ -59,10 +59,12 @@ class ScanWorker(QThread):
 
             # サイズ・更新日時が変わっていないファイルは再処理しない
             existing = index.get(path)
-            if existing and existing[1] == stat.st_size and existing[2] == stat.st_mtime:
-                if not self.tag_new_only:
-                    scanned_ids.append(existing[0])
-                continue
+            if existing:
+                existing_id, size, mtime = existing
+                if size == stat.st_size and mtime == stat.st_mtime:
+                    if not self.tag_new_only:
+                        scanned_ids.append(existing_id)
+                    continue
 
             media_type, duration, thumbnail = load_media_info(path)
             video_id = add_video(path, media_type, duration, thumbnail, stat.st_size, stat.st_mtime)

@@ -2,34 +2,29 @@ import os
 import subprocess
 import sys
 from collections import Counter
-from datetime import datetime
 from urllib.parse import quote_plus
 
-from PyQt6.QtCore import QFile, QRect, QSettings, QSize, QStringListModel, Qt, QUrl
-from PyQt6.QtGui import (
-    QColor, QDesktopServices, QFont, QFontMetrics, QIcon, QKeySequence, QPainter, QPalette, QPen,
-    QPixmap, QShortcut,
-)
+from PyQt6.QtCore import QFile, QSettings, QStringListModel, Qt, QUrl
+from PyQt6.QtGui import QDesktopServices, QIcon, QKeySequence, QPixmap, QShortcut
 from PyQt6.QtWidgets import (
-    QCheckBox, QComboBox, QCompleter, QDialog, QDialogButtonBox, QFileDialog, QHBoxLayout, QInputDialog, QLabel,
-    QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox, QProgressBar,
-    QPushButton, QSplitter, QStyle, QStyledItemDelegate, QStyleOptionViewItem, QToolButton,
-    QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
+    QComboBox, QDialog, QFileDialog, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget,
+    QListWidgetItem, QMainWindow, QMenu, QMessageBox, QProgressBar, QPushButton, QSplitter, QStyle,
+    QToolButton, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
+from core.formatting import (
+    MAX_RATING, format_duration, format_mtime, format_rating, format_size, rating_stars,
+)
 from core.media import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, get_media_type, is_same_or_under
 from core.scanner import ScanWorker
+from core.tags import normalize_tag, split_tag
+from core.widgets import RATING_ROLE, AddTagsDialog, ThumbnailDelegate, ThumbnailGrid, make_tag_completer
 from db.albums import DEFAULT_ALBUM_NAME, create_album, get_directories, list_albums, rename_album, set_directories
 from db.connection import get_db_path, set_db_path
 from db.init import init_table
 from db.exclusions import add_excluded_paths, get_excluded_paths, remove_excluded_paths
-from db.tags import add_tag, remove_tag, rename_tags
+from db.tags import add_tag, remove_tags, rename_tags
 from db.videos import delete_videos, get_all_videos, get_thumbnails, rename_video, set_rating
-
-MAX_COLUMNS = 8         # 1行に並べるサムネイルの最大数
-MIN_CELL_WIDTH = 140    # これより狭くなる場合は列数を減らす
-CELL_PADDING = 20       # セル幅とサムネイル幅の差
-LABEL_HEIGHT = 45       # ファイル名（2行）の表示領域
 
 SORT_KEYS = {
     "名前": lambda v: os.path.basename(v["file_path"]).lower(),
@@ -42,206 +37,8 @@ SORT_KEYS = {
 }
 TYPE_FILTERS = {"すべて": None, "動画": "video", "画像": "image"}
 TYPE_LABELS = {"video": "動画", "image": "画像"}
-MAX_RATING = 10
 INVALID_FILENAME_CHARS = '\\/:*?"<>|'
-RATING_ROLE = Qt.ItemDataRole.UserRole + 1  # サムネイル一覧の各項目に持たせる評価
 GROUP_ROLE = Qt.ItemDataRole.UserRole + 2   # タグ絞り込みツリーのグループ見出しに持たせるグループ名
-STAR_FILLED_COLOR = QColor("#FFC107")
-STAR_EMPTY_COLOR = QColor(255, 255, 255, 110)
-SELECTION_BORDER_WIDTH = 4
-
-
-def rating_stars(rating: int) -> str:
-    return "★" * rating + "☆" * (MAX_RATING - rating)
-
-
-def format_rating(rating: int | None) -> str:
-    return f"{rating_stars(rating)} ({rating}/{MAX_RATING})" if rating else "未評価"
-
-
-class ThumbnailDelegate(QStyledItemDelegate):
-    """サムネイルの描画: 選択中の強調表示と、評価の★を重ねて描く"""
-
-    def paint(self, painter, option, index):
-        opt = QStyleOptionViewItem(option)
-        self.initStyleOption(opt, index)
-        selected = bool(opt.state & QStyle.StateFlag.State_Selected)
-        accent = opt.palette.color(QPalette.ColorGroup.Active, QPalette.ColorRole.Highlight)
-        style = opt.widget.style()
-        if selected and opt.text:
-            # ファイル名の背景を薄くアクセント色にする（標準の選択表示は薄すぎるので使わない）
-            text_rect = style.subElementRect(QStyle.SubElement.SE_ItemViewItemText, opt, opt.widget)
-            painter.fillRect(text_rect, QColor(accent.red(), accent.green(), accent.blue(), 70))
-        base = QStyleOptionViewItem(option)
-        base.state &= ~QStyle.StateFlag.State_Selected
-        super().paint(painter, base, index)
-
-        icon_rect = style.subElementRect(QStyle.SubElement.SE_ItemViewItemDecoration, opt, opt.widget)
-        rating = index.data(RATING_ROLE)
-        if rating:
-            self._paint_rating(painter, opt, icon_rect, rating)
-        if selected:
-            self._paint_selection(painter, icon_rect, accent)
-
-    @staticmethod
-    def _paint_rating(painter, opt, icon_rect: QRect, rating: int):
-        """サムネイルの下端に評価の★を重ねて描画する"""
-        painter.save()
-        font = QFont(opt.font)
-        # 10個の★がサムネイル幅に収まる大きさにする
-        font.setPixelSize(max(8, icon_rect.width() // (MAX_RATING + 1)))
-        painter.setFont(font)
-        metrics = QFontMetrics(font)
-        strip = QRect(icon_rect.left(), icon_rect.bottom() - metrics.height(), icon_rect.width(), metrics.height() + 1)
-        painter.fillRect(strip, QColor(0, 0, 0, 150))
-
-        filled, empty = "★" * rating, "☆" * (MAX_RATING - rating)
-        x = strip.left() + (strip.width() - metrics.horizontalAdvance(filled + empty)) // 2
-        baseline = strip.top() + metrics.ascent()
-        painter.setPen(STAR_FILLED_COLOR)
-        painter.drawText(x, baseline, filled)
-        painter.setPen(STAR_EMPTY_COLOR)
-        painter.drawText(x + metrics.horizontalAdvance(filled), baseline, empty)
-        painter.restore()
-
-    @staticmethod
-    def _paint_selection(painter, icon_rect: QRect, accent: QColor):
-        """選択中のサムネイルに太枠と右上のチェックマークを描画する"""
-        painter.save()
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        pen = QPen(accent, SELECTION_BORDER_WIDTH)
-        pen.setJoinStyle(Qt.PenJoinStyle.MiterJoin)
-        painter.setPen(pen)
-        painter.setBrush(Qt.BrushStyle.NoBrush)
-        # 枠はサムネイルの内側に描く（一覧の端で切れないように）
-        half = SELECTION_BORDER_WIDTH // 2
-        painter.drawRect(icon_rect.adjusted(half, half, -half, -half))
-
-        size = max(16, icon_rect.width() // 7)
-        badge = QRect(icon_rect.right() - size - 3, icon_rect.top() + 3, size, size)
-        painter.setPen(QPen(Qt.GlobalColor.white, 2))
-        painter.setBrush(accent)
-        painter.drawEllipse(badge)
-        font = painter.font()
-        font.setPixelSize(int(size * 0.7))
-        font.setBold(True)
-        painter.setFont(font)
-        painter.drawText(badge, Qt.AlignmentFlag.AlignCenter, "✓")
-        painter.restore()
-
-
-def normalize_tag(name: str) -> str:
-    """「年代：2020」「年代 : 2020」などを「年代:2020」に揃える"""
-    group, value = split_tag(name.replace("：", ":"))
-    return f"{group}:{value}" if group else value
-
-
-def split_tag(name: str) -> tuple[str | None, str]:
-    """「グループ:値」形式のタグを (グループ, 値) に分解（グループなしは (None, タグ名)）"""
-    group, sep, value = name.partition(":")
-    if sep and group.strip() and value.strip():
-        return group.strip(), value.strip()
-    return None, name.strip()
-
-
-def parse_tags(text: str) -> list[str]:
-    """カンマ（, 、）区切りのタグ入力を分解"""
-    names = (normalize_tag(t) for t in text.replace("、", ",").split(","))
-    return list(dict.fromkeys(t for t in names if t))
-
-
-class ThumbnailGrid(QListWidget):
-    """幅に合わせてセルサイズを調整し、1行に最大 MAX_COLUMNS 枚並べるサムネイル一覧"""
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setViewMode(QListWidget.ViewMode.IconMode)
-        self.setResizeMode(QListWidget.ResizeMode.Adjust)
-        self.setMovement(QListWidget.Movement.Static)
-        self.setUniformItemSizes(True)
-        self.setWordWrap(True)
-        self.show_labels = True
-        self._fit_cells()
-
-    def set_show_labels(self, show: bool):
-        """ファイル名を非表示にした場合は、その分セルの高さを詰める"""
-        self.show_labels = show
-        self._fit_cells()
-
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        self._fit_cells()
-
-    def _fit_cells(self):
-        # スクロールバーの表示有無で列数が揺れないよう、常にその幅を差し引いて計算する
-        scrollbar = self.style().pixelMetric(QStyle.PixelMetric.PM_ScrollBarExtent)
-        width = max(self.contentsRect().width() - scrollbar, MIN_CELL_WIDTH)
-        columns = max(1, min(MAX_COLUMNS, width // MIN_CELL_WIDTH))
-        cell_width = width // columns
-        icon = QSize(cell_width - CELL_PADDING, (cell_width - CELL_PADDING) * 9 // 16)
-        grid = QSize(cell_width, icon.height() + (LABEL_HEIGHT if self.show_labels else CELL_PADDING))
-        if icon != self.iconSize() or grid != self.gridSize():
-            self.setIconSize(icon)
-            self.setGridSize(grid)
-
-
-class AddTagsDialog(QDialog):
-    """フォルダ・ファイル追加時に、追加するすべてのファイルへ付けるタグを指定する"""
-
-    def __init__(self, title: str, target: str, completer_model: QStringListModel,
-                 new_only: bool = False, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle(title)
-        self.resize(420, 0)
-
-        self.tag_edit = QLineEdit()
-        self.tag_edit.setPlaceholderText("例: 旅行, 2024年（空欄なら拡張子タグのみ）")
-        completer = QCompleter(completer_model, self)
-        completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
-        completer.setFilterMode(Qt.MatchFlag.MatchContains)
-        self.tag_edit.setCompleter(completer)
-        self.new_only_check = QCheckBox("登録済みのファイルにはタグを付けない（新しく登録するファイルのみ）")
-        self.new_only_check.setChecked(new_only)
-
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-
-        target_label = QLabel(target)
-        target_label.setWordWrap(True)
-        layout = QVBoxLayout(self)
-        layout.addWidget(target_label)
-        layout.addWidget(QLabel("追加するファイルに付けるタグ（カンマ区切り）"))
-        layout.addWidget(self.tag_edit)
-        layout.addWidget(self.new_only_check)
-        layout.addWidget(buttons)
-
-    def tags(self) -> list[str]:
-        return parse_tags(self.tag_edit.text())
-
-    def new_only(self) -> bool:
-        return self.new_only_check.isChecked()
-
-
-def format_duration(seconds: float | None) -> str:
-    if not seconds:
-        return "-"
-    minutes, sec = divmod(int(seconds), 60)
-    hours, minutes = divmod(minutes, 60)
-    return f"{hours}:{minutes:02}:{sec:02}" if hours else f"{minutes}:{sec:02}"
-
-
-def format_size(size: int | None) -> str:
-    if size is None:
-        return "-"
-    for unit in ("B", "KB", "MB", "GB"):
-        if size < 1024 or unit == "GB":
-            return f"{size:.1f} {unit}" if unit != "B" else f"{size} B"
-        size /= 1024
-
-
-def format_mtime(mtime: float | None) -> str:
-    return datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M") if mtime else "-"
 
 
 class VideoTagApp(QMainWindow):
@@ -374,10 +171,8 @@ class VideoTagApp(QMainWindow):
         self.grid.itemDoubleClicked.connect(
             lambda item: self.open_file(self.video_by_id[item.data(Qt.ItemDataRole.UserRole)]["file_path"])
         )
-        delete_shortcut = QShortcut(QKeySequence.StandardKey.Delete, self.grid)
-        delete_shortcut.setContext(Qt.ShortcutContext.WidgetShortcut)
-        delete_shortcut.activated.connect(self.exclude_selection)
-        for key, slot in (("Shift+Delete", self.delete_selection), ("F2", self.rename_selection)):
+        for key, slot in ((QKeySequence.StandardKey.Delete, self.exclude_selection),
+                          ("Shift+Delete", self.delete_selection), ("F2", self.rename_selection)):
             shortcut = QShortcut(QKeySequence(key), self.grid)
             shortcut.setContext(Qt.ShortcutContext.WidgetShortcut)
             shortcut.activated.connect(slot)
@@ -399,10 +194,7 @@ class VideoTagApp(QMainWindow):
         self.tag_input.setPlaceholderText("タグを入力して Enter")
         self.tag_input.returnPressed.connect(self.add_tag_to_selection)
         self.completer_model = QStringListModel()
-        completer = QCompleter(self.completer_model)
-        completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
-        completer.setFilterMode(Qt.MatchFlag.MatchContains)
-        self.tag_input.setCompleter(completer)
+        self.tag_input.setCompleter(make_tag_completer(self.completer_model, self))
         self.add_tag_button = QPushButton("追加")
         self.add_tag_button.clicked.connect(self.add_tag_to_selection)
 
@@ -474,6 +266,12 @@ class VideoTagApp(QMainWindow):
         self.progress_bar.hide()
         self.statusBar().addPermanentWidget(self.progress_bar)
         self.statusBar().addPermanentWidget(self.count_label)
+
+        # スキャン中は操作できないようにするもの（DBの登録内容やアルバムを変える操作）
+        self.scan_locked_widgets = (
+            self.add_files_button, self.add_dir_button, self.rescan_button, self.exclude_dir_button,
+            self.album_combo, self.album_menu_button,
+        )
 
     # -------------------------------------------------------------- アルバム
     def open_album(self, path: str):
@@ -557,7 +355,7 @@ class VideoTagApp(QMainWindow):
                 self.icons[video_id] = QIcon(pixmap)
 
         self.refresh_tag_filter()
-        self.completer_model.setStringList(sorted({t for v in self.videos for t in v["tags"]}, key=str.lower))
+        self.completer_model.setStringList(sorted(self._all_tags(), key=str.lower))
         self.apply_filters()
 
     def refresh_tag_filter(self):
@@ -636,9 +434,7 @@ class VideoTagApp(QMainWindow):
         if self._rename_tags({n: f"{new_group}:{split_tag(n)[1]}" for n in names}):
             collapsed = self._collapsed_groups()
             if group in collapsed:
-                collapsed.discard(group)
-                collapsed.add(new_group)
-                self.settings.setValue("filter/collapsed_groups", sorted(collapsed))
+                self._save_collapsed_groups(collapsed - {group} | {new_group})
                 self.refresh_tag_filter()
 
     def ungroup(self, group: str):
@@ -652,7 +448,7 @@ class VideoTagApp(QMainWindow):
 
     def _rename_tags(self, renames: dict[str, str]) -> bool:
         """タグ名を一括変更し、絞り込みのチェック状態も引き継ぐ（キャンセル時は False）"""
-        existing = {t for v in self.videos for t in v["tags"]}
+        existing = self._all_tags()
         merged = sorted(new for old, new in renames.items() if new in existing and new != old)
         if merged:
             answer = QMessageBox.question(
@@ -676,18 +472,14 @@ class VideoTagApp(QMainWindow):
 
     def _group_tags(self, group: str) -> list[str]:
         """グループに属するタグ名の一覧"""
-        return sorted({t for v in self.videos for t in v["tags"] if split_tag(t)[0] == group})
+        return sorted(t for t in self._all_tags() if split_tag(t)[0] == group)
 
     def on_tag_group_toggled(self, item: QTreeWidgetItem):
         group = item.data(0, GROUP_ROLE)
         if group is None:
             return
         collapsed = self._collapsed_groups()
-        if item.isExpanded():
-            collapsed.discard(group)
-        else:
-            collapsed.add(group)
-        self.settings.setValue("filter/collapsed_groups", sorted(collapsed))
+        self._save_collapsed_groups(collapsed - {group} if item.isExpanded() else collapsed | {group})
 
     def apply_filters(self):
         """検索・種類・タグで絞り込み、並び替えて一覧を再描画"""
@@ -739,7 +531,7 @@ class VideoTagApp(QMainWindow):
         self.update_detail()
 
     def update_detail(self):
-        videos = [self.video_by_id[i] for i in self._selected_ids()]
+        videos = self._selected_videos()
         for widget in (self.tag_input, self.add_tag_button, self.remove_tag_button, self.rating_combo):
             widget.setEnabled(bool(videos))
         self.exclude_button.setEnabled(bool(videos) and not self.scanning)
@@ -804,13 +596,12 @@ class VideoTagApp(QMainWindow):
         names = [item.data(Qt.ItemDataRole.UserRole) for item in self.detail_tags.selectedItems()]
         if not ids or not names:
             return
-        for name in names:
-            remove_tag(ids, name)
+        remove_tags(ids, names)
         self.reload_from_db()
 
     def exclude_selection(self):
         """選択中のファイルをDBから除外（ファイル自体は削除しない）"""
-        videos = [self.video_by_id[i] for i in self._selected_ids()]
+        videos = self._selected_videos()
         if not videos or self.scanning:
             return
         answer = QMessageBox.question(
@@ -828,7 +619,7 @@ class VideoTagApp(QMainWindow):
 
     def rename_selection(self):
         """選択中のファイル名を変更（実ファイルもリネームする）"""
-        videos = [self.video_by_id[i] for i in self._selected_ids()]
+        videos = self._selected_videos()
         if len(videos) != 1 or self.scanning:
             return
         video = videos[0]
@@ -867,7 +658,7 @@ class VideoTagApp(QMainWindow):
 
     def delete_selection(self):
         """選択中のファイルをごみ箱へ移動し、DBからも削除する"""
-        videos = [self.video_by_id[i] for i in self._selected_ids()]
+        videos = self._selected_videos()
         if not videos or self.scanning:
             return
         target = os.path.basename(videos[0]["file_path"]) if len(videos) == 1 else f"選択中の {len(videos)} 件"
@@ -902,7 +693,7 @@ class VideoTagApp(QMainWindow):
         """選択したフォルダ内のファイルをすべてDBから除外（ファイル自体は削除しない）"""
         if self.scanning:
             return
-        directories = self._directories()
+        directories = get_directories()
         directory = QFileDialog.getExistingDirectory(
             self, "DBから除外するフォルダを選択", directories[0] if directories else "",
         )
@@ -944,7 +735,7 @@ class VideoTagApp(QMainWindow):
         dialog = self._ask_add_tags("フォルダを追加", directory)
         if not dialog:
             return
-        directories = self._directories()
+        directories = get_directories()
         if directory not in directories:
             directories.append(directory)
             set_directories(directories)
@@ -970,7 +761,7 @@ class VideoTagApp(QMainWindow):
         self.start_scan([], dialog.tags(), files, tag_new_only=dialog.new_only())
 
     def rescan_all(self):
-        directories = self._directories()
+        directories = get_directories()
         if directories:
             self.start_scan(directories)
         else:
@@ -980,13 +771,7 @@ class VideoTagApp(QMainWindow):
                    tag_new_only: bool = False):
         if self.scanning:
             return
-        self.scanning = True
-        self.add_files_button.setEnabled(False)
-        self.add_dir_button.setEnabled(False)
-        self.rescan_button.setEnabled(False)
-        self.exclude_dir_button.setEnabled(False)
-        self.album_combo.setEnabled(False)
-        self.album_menu_button.setEnabled(False)
+        self._set_scanning(True)
         self.progress_bar.setValue(0)
         self.progress_bar.show()
         self.statusBar().showMessage("ファイルを検索中...")
@@ -1003,13 +788,7 @@ class VideoTagApp(QMainWindow):
         self.statusBar().showMessage(f"スキャン中 ({done}/{total}): {os.path.basename(path)}")
 
     def on_scan_finished(self, added: int, updated: int, removed: int):
-        self.scanning = False
-        self.add_files_button.setEnabled(True)
-        self.add_dir_button.setEnabled(True)
-        self.rescan_button.setEnabled(True)
-        self.exclude_dir_button.setEnabled(True)
-        self.album_combo.setEnabled(True)
-        self.album_menu_button.setEnabled(True)
+        self._set_scanning(False)
         self.progress_bar.hide()
         self.statusBar().showMessage(f"スキャン完了: 追加 {added} / 更新 {updated} / 削除 {removed}", 10000)
         self.icons.clear()  # 更新されたファイルのサムネイルを読み直す
@@ -1080,8 +859,20 @@ class VideoTagApp(QMainWindow):
         header.addWidget(minimize_button)
         return header
 
+    def _set_scanning(self, scanning: bool):
+        self.scanning = scanning
+        for widget in self.scan_locked_widgets:
+            widget.setEnabled(not scanning)
+
+    def _all_tags(self) -> set[str]:
+        """現在のアルバムで使われているすべてのタグ名"""
+        return {t for v in self.videos for t in v["tags"]}
+
     def _selected_ids(self) -> list[int]:
         return [item.data(Qt.ItemDataRole.UserRole) for item in self.grid.selectedItems()]
+
+    def _selected_videos(self) -> list[dict]:
+        return [self.video_by_id[i] for i in self._selected_ids()]
 
     def _filter_tag_items(self):
         """タグ絞り込みツリーのタグ項目（グループ見出しを除く）を列挙"""
@@ -1102,5 +893,5 @@ class VideoTagApp(QMainWindow):
     def _collapsed_groups(self) -> set[str]:
         return set(self.settings.value("filter/collapsed_groups", [], type=list))
 
-    def _directories(self) -> list[str]:
-        return get_directories()
+    def _save_collapsed_groups(self, groups: set[str]):
+        self.settings.setValue("filter/collapsed_groups", sorted(groups))
