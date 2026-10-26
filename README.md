@@ -13,6 +13,13 @@
 pip install PyQt6 ffmpeg-python Pillow
 ```
 
+### テスト
+```
+pip install pytest
+python -m pytest
+```
+- 画面を表示せずに実行します。DB・設定・テスト用の画像はすべて一時フォルダに作られ、実際のアルバムや設定には触れません
+
 ### 起動
 ```
 python app/main.py

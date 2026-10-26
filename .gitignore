@@ -1,3 +1,4 @@
 video.db
 albums/
 *pycache*
+.pytest_cache/
