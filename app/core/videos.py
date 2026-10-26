@@ -7,7 +7,7 @@ from urllib.parse import quote_plus
 from PyQt6.QtCore import QFile, QSettings, QStringListModel, Qt, QUrl
 from PyQt6.QtGui import QDesktopServices, QIcon, QKeySequence, QPixmap, QShortcut
 from PyQt6.QtWidgets import (
-    QComboBox, QDialog, QFileDialog, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget,
+    QApplication, QComboBox, QDialog, QFileDialog, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget,
     QListWidgetItem, QMainWindow, QMenu, QMessageBox, QProgressBar, QPushButton, QSplitter, QStyle,
     QToolButton, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
@@ -18,6 +18,7 @@ from core.formatting import (
 from core.media import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, get_media_type, is_same_or_under
 from core.scanner import ScanWorker
 from core.tags import normalize_tag, split_tag
+from core.transfer import export_album, import_album
 from core.widgets import RATING_ROLE, AddTagsDialog, ThumbnailDelegate, ThumbnailGrid, make_tag_completer
 from db.albums import DEFAULT_ALBUM_NAME, create_album, get_directories, list_albums, rename_album, set_directories
 from db.connection import get_db_path, set_db_path
@@ -75,6 +76,9 @@ class VideoTagApp(QMainWindow):
         album_menu = QMenu(self)
         album_menu.addAction("新しいアルバム...", self.create_album)
         album_menu.addAction("アルバム名を変更...", self.rename_album)
+        album_menu.addSeparator()
+        album_menu.addAction("タグ・評価をエクスポート...", self.export_tags)
+        album_menu.addAction("タグ・評価をインポート...", self.import_tags)
         album_menu.addSeparator()
         self.delete_album_action = album_menu.addAction("アルバムを削除...", self.delete_album)
         self.album_menu_button.setMenu(album_menu)
@@ -172,7 +176,8 @@ class VideoTagApp(QMainWindow):
             lambda item: self.open_file(self.video_by_id[item.data(Qt.ItemDataRole.UserRole)]["file_path"])
         )
         for key, slot in ((QKeySequence.StandardKey.Delete, self.exclude_selection),
-                          ("Shift+Delete", self.delete_selection), ("F2", self.rename_selection)):
+                          ("Shift+Delete", self.delete_selection), ("F2", self.rename_selection),
+                          ("Ctrl+Shift+C", self.copy_selected_paths)):
             shortcut = QShortcut(QKeySequence(key), self.grid)
             shortcut.setContext(Qt.ShortcutContext.WidgetShortcut)
             shortcut.activated.connect(slot)
@@ -264,7 +269,12 @@ class VideoTagApp(QMainWindow):
         self.progress_bar = QProgressBar()
         self.progress_bar.setMaximumWidth(200)
         self.progress_bar.hide()
+        self.cancel_scan_button = QPushButton("中止")
+        self.cancel_scan_button.setToolTip("スキャンを中止（処理済みのファイルは登録されたまま残ります）")
+        self.cancel_scan_button.clicked.connect(self.cancel_scan)
+        self.cancel_scan_button.hide()
         self.statusBar().addPermanentWidget(self.progress_bar)
+        self.statusBar().addPermanentWidget(self.cancel_scan_button)
         self.statusBar().addPermanentWidget(self.count_label)
 
         # スキャン中は操作できないようにするもの（DBの登録内容やアルバムを変える操作）
@@ -341,6 +351,36 @@ class VideoTagApp(QMainWindow):
         remaining = [p for p, _ in list_albums() if p != path]
         self.open_album(remaining[0])
         self.statusBar().showMessage(f"アルバム「{current}」を削除しました", 10000)
+
+    def export_tags(self):
+        album = self.album_combo.currentText()
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "タグ・評価をエクスポート", f"{album}.json", "JSON (*.json)",
+        )
+        if not file_path:
+            return
+        try:
+            count = export_album(file_path, album)
+        except OSError as e:
+            QMessageBox.warning(self, "エクスポート", f"書き出せませんでした:\n{e}")
+            return
+        self.statusBar().showMessage(f"{count} 件のタグ・評価を書き出しました: {file_path}", 10000)
+
+    def import_tags(self):
+        file_path, _ = QFileDialog.getOpenFileName(self, "タグ・評価をインポート", "", "JSON (*.json)")
+        if not file_path:
+            return
+        try:
+            matched, unmatched = import_album(file_path)
+        except (OSError, ValueError) as e:  # json.JSONDecodeError は ValueError
+            QMessageBox.warning(self, "インポート", f"読み込めませんでした:\n{e}")
+            return
+        self.reload_from_db()
+        message = f"{matched} 件のファイルにタグ・評価を反映しました。"
+        if unmatched:
+            message += (f"\n\n{unmatched} 件はこのアルバムに見つかりませんでした。"
+                        "\n先にフォルダを追加・スキャンしてから、もう一度インポートしてください。")
+        QMessageBox.information(self, "インポート", message)
 
     # ---------------------------------------------------------------- データ
     def reload_from_db(self):
@@ -774,6 +814,8 @@ class VideoTagApp(QMainWindow):
         self._set_scanning(True)
         self.progress_bar.setValue(0)
         self.progress_bar.show()
+        self.cancel_scan_button.setEnabled(True)
+        self.cancel_scan_button.show()
         self.statusBar().showMessage("ファイルを検索中...")
 
         self.scan_worker = ScanWorker(directories, tags, files, tag_new_only, parent=self)
@@ -787,10 +829,19 @@ class VideoTagApp(QMainWindow):
         self.progress_bar.setValue(done)
         self.statusBar().showMessage(f"スキャン中 ({done}/{total}): {os.path.basename(path)}")
 
-    def on_scan_finished(self, added: int, updated: int, removed: int):
+    def cancel_scan(self):
+        if self.scan_worker and self.scan_worker.isRunning():
+            self.scan_worker.requestInterruption()
+            self.cancel_scan_button.setEnabled(False)
+            self.statusBar().showMessage("スキャンを中止しています...")
+
+    def on_scan_finished(self, added: int, updated: int, removed: int, moved: int):
         self._set_scanning(False)
         self.progress_bar.hide()
-        self.statusBar().showMessage(f"スキャン完了: 追加 {added} / 更新 {updated} / 削除 {removed}", 10000)
+        self.cancel_scan_button.hide()
+        cancelled = self.scan_worker.isInterruptionRequested()
+        summary = f"追加 {added} / 更新 {updated} / 移動 {moved} / 削除 {removed}"
+        self.statusBar().showMessage(f"スキャンを中止しました: {summary}" if cancelled else f"スキャン完了: {summary}", 10000)
         self.icons.clear()  # 更新されたファイルのサムネイルを読み直す
         self.reload_from_db()
 
@@ -808,6 +859,8 @@ class VideoTagApp(QMainWindow):
 
         menu = QMenu(self)
         menu.addAction("開く", lambda: self.open_file(video["file_path"]))
+        menu.addAction("エクスプローラーで表示", lambda: self.reveal_file(video["file_path"]))
+        menu.addAction("パスをコピー (Ctrl+Shift+C)", self.copy_selected_paths)
         menu.addAction("Googleで検索", lambda: self.search_google(video["file_path"]))
         menu.addSeparator()
         rename = menu.addAction("名前を変更 (F2)", self.rename_selection)
@@ -816,6 +869,29 @@ class VideoTagApp(QMainWindow):
                            ("ファイルを削除 (Shift+Delete)", self.delete_selection)):
             menu.addAction(text, slot).setEnabled(not self.scanning)
         menu.exec(self.grid.viewport().mapToGlobal(pos))
+
+    def reveal_file(self, file_path: str):
+        """ファイルの場所をエクスプローラー（Finder）で開き、そのファイルを選択状態にする"""
+        if not os.path.exists(file_path):
+            directory = os.path.dirname(file_path)
+            if not os.path.isdir(directory):
+                QMessageBox.warning(self, "エクスプローラーで表示", f"ファイルが見つかりません:\n{file_path}")
+                return
+            QDesktopServices.openUrl(QUrl.fromLocalFile(directory))
+        elif os.name == "nt":
+            subprocess.Popen(f'explorer /select,"{os.path.normpath(file_path)}"')
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", "-R", file_path])
+        else:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(os.path.dirname(file_path)))
+
+    def copy_selected_paths(self):
+        """選択中のファイルのフルパスをクリップボードへ（複数なら1行に1つ）"""
+        paths = [v["file_path"] for v in self._selected_videos()]
+        if not paths:
+            return
+        QApplication.clipboard().setText("\n".join(paths))
+        self.statusBar().showMessage(f"{len(paths)} 件のパスをコピーしました", 5000)
 
     def search_google(self, file_path: str):
         """ファイル名（拡張子なし）をブラウザでGoogle検索"""

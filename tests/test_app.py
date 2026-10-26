@@ -145,3 +145,54 @@ def test_reopens_last_album(window, tmp_path, monkeypatch):
     reopened = cv.VideoTagApp()
     assert reopened.windowTitle().endswith("2つ目")
     reopened.close()
+
+
+def test_scan_message_includes_moved(scanned, qapp, media_dir):
+    (media_dir / "a.jpg").rename(media_dir / "moved.jpg")
+    scan_and_wait(scanned, qapp, [media_dir])
+    assert "移動 1" in scanned.statusBar().currentMessage()
+    assert len(scanned.videos) == 3
+
+
+def test_cancel_scan(window, qapp, media_dir, monkeypatch):
+    # 開始直後に中止ボタンを押した状態にする
+    monkeypatch.setattr(cv.ScanWorker, "isInterruptionRequested", lambda self: True)
+    window.start_scan([str(media_dir)])
+    assert window.cancel_scan_button.isVisibleTo(window)
+    window.cancel_scan()
+    window.scan_worker.wait()
+    qapp.processEvents()
+    assert not window.scanning
+    assert not window.cancel_scan_button.isVisibleTo(window)
+    assert window.statusBar().currentMessage().startswith("スキャンを中止しました")
+
+
+def test_copy_selected_paths(scanned, qapp):
+    select_all(scanned)
+    scanned.copy_selected_paths()
+    assert sorted(qapp.clipboard().text().split("\n")) == sorted(v["file_path"] for v in scanned.videos)
+
+
+def test_reveal_missing_file_warns(scanned, monkeypatch, tmp_path):
+    warnings = []
+    monkeypatch.setattr(cv.QMessageBox, "warning", staticmethod(lambda *a, **k: warnings.append(a)))
+    scanned.reveal_file(str(tmp_path / "no_such_dir" / "x.jpg"))
+    assert warnings
+
+
+def test_export_import_via_menu(scanned, monkeypatch, tmp_path):
+    out = str(tmp_path / "export.json")
+    monkeypatch.setattr(cv.QFileDialog, "getSaveFileName", staticmethod(lambda *a, **k: (out, "")))
+    monkeypatch.setattr(cv.QFileDialog, "getOpenFileName", staticmethod(lambda *a, **k: (out, "")))
+    infos = []
+    monkeypatch.setattr(cv.QMessageBox, "information", staticmethod(lambda *a, **k: infos.append(a)))
+
+    select_all(scanned)
+    scanned.set_rating_to_selection(6)
+    scanned.export_tags()
+
+    select_all(scanned)
+    scanned.set_rating_to_selection(0)
+    scanned.import_tags()
+    assert all(v["rating"] == 6 for v in scanned.videos)
+    assert "3 件" in infos[0][2]

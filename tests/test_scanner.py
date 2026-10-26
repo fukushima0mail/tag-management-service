@@ -8,8 +8,8 @@ from db.tags import add_tag
 from db.videos import get_all_videos
 
 
-def scan(directories=(), tags=None, files=None, tag_new_only=False) -> tuple[int, int, int]:
-    """スキャンをスレッドを使わずに実行し、(追加, 更新, 削除) を返す"""
+def scan(directories=(), tags=None, files=None, tag_new_only=False) -> tuple[int, int, int, int]:
+    """スキャンをスレッドを使わずに実行し、(追加, 更新, 削除, 移動) を返す"""
     worker = ScanWorker([str(d) for d in directories], tags, [str(f) for f in files or []], tag_new_only)
     result = []
     worker.scan_finished.connect(lambda *counts: result.append(counts))
@@ -27,7 +27,7 @@ def _qapp(qapp):
 
 
 def test_scan_registers_media_with_extension_and_given_tags(album, media_dir):
-    assert scan([media_dir], tags=["旅行"]) == (3, 0, 0)
+    assert scan([media_dir], tags=["旅行"]) == (3, 0, 0, 0)
     videos = videos_by_name()
     assert sorted(videos) == ["a.jpg", "b.png", "c.jpg"]
     assert set(videos["b.png"]["tags"]) == {"旅行", "拡張子:png"}
@@ -36,25 +36,25 @@ def test_scan_registers_media_with_extension_and_given_tags(album, media_dir):
 
 def test_rescan_skips_unchanged_and_updates_modified(album, media_dir):
     scan([media_dir])
-    assert scan([media_dir]) == (0, 0, 0)
+    assert scan([media_dir]) == (0, 0, 0, 0)
 
     path = media_dir / "a.jpg"
     stat = path.stat()
     os.utime(path, (stat.st_atime, stat.st_mtime + 10))
-    assert scan([media_dir]) == (0, 1, 0)
+    assert scan([media_dir]) == (0, 1, 0, 0)
 
 
 def test_rescan_removes_deleted_files(album, media_dir):
     scan([media_dir])
     (media_dir / "b.png").unlink()
-    assert scan([media_dir]) == (0, 0, 1)
+    assert scan([media_dir]) == (0, 0, 1, 0)
     assert "b.png" not in videos_by_name()
 
 
 def test_missing_directory_does_not_remove_files(album, media_dir, tmp_path):
     scan([media_dir])
     media_dir.rename(tmp_path / "unplugged")  # 外付けドライブ未接続など
-    assert scan([media_dir]) == (0, 0, 0)
+    assert scan([media_dir]) == (0, 0, 0, 0)
     assert len(get_all_videos()) == 3
 
 
@@ -85,7 +85,7 @@ def test_explicit_directory_overrides_excluded_parent(album, media_dir):
 
 
 def test_scan_individual_files(album, media_dir):
-    assert scan(files=[media_dir / "b.png"], tags=["個別"]) == (1, 0, 0)
+    assert scan(files=[media_dir / "b.png"], tags=["個別"]) == (1, 0, 0, 0)
     assert set(videos_by_name()["b.png"]["tags"]) == {"個別", "拡張子:png"}
 
 
@@ -95,3 +95,78 @@ def test_scan_keeps_existing_tags(album, media_dir):
     add_tag([video_id], "手動")
     scan([media_dir])
     assert "手動" in videos_by_name()["a.jpg"]["tags"]
+
+
+# ---------------------------------------------------------------- 移動・リネーム
+def _tag_and_rate(name: str, tag: str, rating: int):
+    from db.videos import set_rating
+    video = videos_by_name()[name]
+    add_tag([video["id"]], tag)
+    set_rating([video["id"]], rating)
+    return video["id"]
+
+
+def test_renamed_file_keeps_tags_and_rating(album, media_dir):
+    scan([media_dir])
+    video_id = _tag_and_rate("a.jpg", "お気に入り", 9)
+    (media_dir / "a.jpg").rename(media_dir / "renamed.jpg")
+
+    assert scan([media_dir]) == (0, 0, 0, 1)
+    video = videos_by_name()["renamed.jpg"]
+    assert video["id"] == video_id
+    assert "お気に入り" in video["tags"] and video["rating"] == 9
+    assert "a.jpg" not in videos_by_name()
+
+
+def test_moved_to_other_folder_keeps_tags(album, media_dir, tmp_path):
+    scan([media_dir])
+    _tag_and_rate("b.png", "移動前", 3)
+    other = tmp_path / "other"
+    other.mkdir()
+    (media_dir / "b.png").rename(other / "b.png")
+
+    # 移動先のフォルダだけをスキャンしても引き継がれる
+    assert scan([other]) == (0, 0, 0, 1)
+    assert videos_by_name()["b.png"]["file_path"] == str(other / "b.png")
+    assert "移動前" in videos_by_name()["b.png"]["tags"]
+
+
+def test_renamed_folder_keeps_tags(album, media_dir, tmp_path):
+    scan([media_dir])
+    _tag_and_rate("c.jpg", "サブ", 5)
+    (media_dir / "sub").rename(media_dir / "sub2")
+    assert scan([media_dir]) == (0, 0, 0, 1)
+    assert "サブ" in videos_by_name()["c.jpg"]["tags"]
+
+
+def test_copied_file_is_registered_as_new(album, media_dir, tmp_path):
+    """元ファイルが残っている場合（コピー）は、別ファイルとして新規登録する"""
+    import shutil
+    scan([media_dir])
+    _tag_and_rate("a.jpg", "元", 1)
+    shutil.copy2(media_dir / "a.jpg", media_dir / "copy.jpg")  # 更新日時もコピーされる
+    assert scan([media_dir]) == (1, 0, 0, 0)
+    assert "元" not in videos_by_name()["copy.jpg"]["tags"]
+
+
+def test_changed_size_is_not_treated_as_move(album, media_dir):
+    from PIL import Image
+    scan([media_dir])
+    _tag_and_rate("a.jpg", "別物", 1)
+    (media_dir / "a.jpg").unlink()
+    Image.new("RGB", (200, 100), "green").save(media_dir / "new.jpg")
+    assert scan([media_dir]) == (1, 0, 1, 0)
+    assert "別物" not in videos_by_name()["new.jpg"]["tags"]
+
+
+# ---------------------------------------------------------------- 中止
+def test_interrupted_scan_does_not_remove_files(album, media_dir):
+    scan([media_dir])
+    (media_dir / "b.png").unlink()
+    worker = ScanWorker([str(media_dir)])
+    result = []
+    worker.scan_finished.connect(lambda *counts: result.append(counts))
+    worker.isInterruptionRequested = lambda: True  # 開始直後に中止された状態
+    worker.run()
+    assert result == [(0, 0, 0, 0)]
+    assert "b.png" in videos_by_name()  # 中止時は削除しない
