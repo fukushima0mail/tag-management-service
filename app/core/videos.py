@@ -19,6 +19,9 @@ from PyQt6.QtWidgets import (
 
 from core.media import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, get_media_type, is_same_or_under
 from core.scanner import ScanWorker
+from db.albums import create_album, get_directories, list_albums, rename_album, set_directories
+from db.connection import DEFAULT_DB_PATH, get_db_path, set_db_path
+from db.init import init_table
 from db.exclusions import add_excluded_paths, get_excluded_paths, remove_excluded_paths
 from db.tags import add_tag, remove_tag, rename_tags
 from db.videos import delete_videos, get_all_videos, get_thumbnails, rename_video, set_rating
@@ -256,11 +259,24 @@ class VideoTagApp(QMainWindow):
         self.scanning = False
 
         self._build_ui()
-        self.reload_from_db()
+        album = self.settings.value("album/current", DEFAULT_DB_PATH)
+        self.open_album(album if os.path.exists(album) else DEFAULT_DB_PATH)
 
     # ------------------------------------------------------------------ UI
     def _build_ui(self):
-        # 上部ツールバー: フォルダ操作・検索・種類・並び替え
+        # 上部ツールバー: アルバム・フォルダ操作・検索・種類・並び替え
+        self.album_combo = QComboBox()
+        self.album_combo.setMinimumWidth(140)
+        self.album_combo.activated.connect(self.on_album_selected)
+        self.album_menu_button = QToolButton()
+        self.album_menu_button.setText("…")
+        self.album_menu_button.setToolTip("アルバムの作成・名前変更")
+        self.album_menu_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        album_menu = QMenu(self)
+        album_menu.addAction("新しいアルバム...", self.create_album)
+        album_menu.addAction("アルバム名を変更...", self.rename_album)
+        self.album_menu_button.setMenu(album_menu)
+
         self.add_dir_button = QPushButton("フォルダを追加...")
         self.add_dir_button.clicked.connect(self.choose_directory)
         self.rescan_button = QPushButton("再スキャン")
@@ -296,6 +312,10 @@ class VideoTagApp(QMainWindow):
         self.label_toggle.setToolTip("サムネイル一覧のファイル名表示を切り替え")
 
         operation_row = QHBoxLayout()
+        operation_row.addWidget(QLabel("アルバム:"))
+        operation_row.addWidget(self.album_combo)
+        operation_row.addWidget(self.album_menu_button)
+        operation_row.addSpacing(12)
         operation_row.addWidget(self.add_dir_button)
         operation_row.addWidget(self.add_files_button)
         operation_row.addWidget(self.rescan_button)
@@ -449,6 +469,52 @@ class VideoTagApp(QMainWindow):
         self.progress_bar.hide()
         self.statusBar().addPermanentWidget(self.progress_bar)
         self.statusBar().addPermanentWidget(self.count_label)
+
+    # -------------------------------------------------------------- アルバム
+    def open_album(self, path: str):
+        """アルバム（DBファイル）を切り替えて一覧を読み込む"""
+        set_db_path(path)
+        init_table()
+        # 旧バージョンでアプリ設定に保存していた登録フォルダは、最初のアルバムへ移す
+        if path == DEFAULT_DB_PATH and self.settings.contains("directories"):
+            if not get_directories():
+                set_directories(self.settings.value("directories", [], type=list))
+            self.settings.remove("directories")
+        self.settings.setValue("album/current", path)
+        self.icons.clear()
+        self.grid.clearSelection()
+        self.refresh_album_combo()
+        self.reload_from_db()
+
+    def refresh_album_combo(self):
+        self.album_combo.clear()
+        current = get_db_path()
+        for path, name in list_albums():
+            self.album_combo.addItem(name, path)
+            if path == current:
+                self.album_combo.setCurrentIndex(self.album_combo.count() - 1)
+                self.setWindowTitle(f"動画タグ管理アプリ - {name}")
+
+    def on_album_selected(self, index: int):
+        path = self.album_combo.itemData(index)
+        if path != get_db_path():
+            self.open_album(path)
+
+    def create_album(self):
+        name, ok = QInputDialog.getText(
+            self, "新しいアルバム", "アルバム名", text=f"アルバム {self.album_combo.count() + 1}",
+        )
+        name = name.strip()
+        if ok and name:
+            self.open_album(create_album(name))
+
+    def rename_album(self):
+        current = self.album_combo.currentText()
+        name, ok = QInputDialog.getText(self, "アルバム名を変更", f"「{current}」の新しい名前", text=current)
+        name = name.strip()
+        if ok and name and name != current:
+            rename_album(name)
+            self.refresh_album_combo()
 
     # ---------------------------------------------------------------- データ
     def reload_from_db(self):
@@ -827,7 +893,7 @@ class VideoTagApp(QMainWindow):
 
         # 除外フォルダ自身・配下の登録フォルダはスキャン対象から外す
         remaining = [d for d in directories if not is_same_or_under(d, directory)]
-        self.settings.setValue("directories", remaining)
+        set_directories(remaining)
         # 登録フォルダの一部だけを除外する場合は、再スキャンで再登録されないよう記録する
         if any(is_same_or_under(directory, d) for d in remaining):
             add_excluded_paths([directory])
@@ -853,7 +919,7 @@ class VideoTagApp(QMainWindow):
         directories = self._directories()
         if directory not in directories:
             directories.append(directory)
-            self.settings.setValue("directories", directories)
+            set_directories(directories)
         # フォルダを追加し直した場合は、以前除外したファイル・フォルダも再登録する
         remove_excluded_paths([p for p in get_excluded_paths() if is_same_or_under(p, directory)])
         self.start_scan([directory], dialog.tags(), tag_new_only=dialog.new_only())
@@ -891,6 +957,8 @@ class VideoTagApp(QMainWindow):
         self.add_dir_button.setEnabled(False)
         self.rescan_button.setEnabled(False)
         self.exclude_dir_button.setEnabled(False)
+        self.album_combo.setEnabled(False)
+        self.album_menu_button.setEnabled(False)
         self.progress_bar.setValue(0)
         self.progress_bar.show()
         self.statusBar().showMessage("ファイルを検索中...")
@@ -912,6 +980,8 @@ class VideoTagApp(QMainWindow):
         self.add_dir_button.setEnabled(True)
         self.rescan_button.setEnabled(True)
         self.exclude_dir_button.setEnabled(True)
+        self.album_combo.setEnabled(True)
+        self.album_menu_button.setEnabled(True)
         self.progress_bar.hide()
         self.statusBar().showMessage(f"スキャン完了: 追加 {added} / 更新 {updated} / 削除 {removed}", 10000)
         self.icons.clear()  # 更新されたファイルのサムネイルを読み直す
@@ -1005,4 +1075,4 @@ class VideoTagApp(QMainWindow):
         return set(self.settings.value("filter/collapsed_groups", [], type=list))
 
     def _directories(self) -> list[str]:
-        return self.settings.value("directories", [], type=list)
+        return get_directories()

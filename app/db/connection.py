@@ -1,9 +1,22 @@
 import sqlite3
 
+DEFAULT_DB_PATH = 'video.db'
+
+_db_path = DEFAULT_DB_PATH  # 現在開いているアルバムのDB
+
+
+def set_db_path(path: str):
+    global _db_path
+    _db_path = path
+
+
+def get_db_path() -> str:
+    return _db_path
+
 
 class DBConnection:
-    def __init__(self):
-        self.db_name = 'video.db'
+    def __init__(self, db_name: str | None = None):
+        self.db_name = db_name or _db_path
         self.conn = None
         self.cursor = None
 
