@@ -1,13 +1,13 @@
 """アルバム（1アルバム = 1DBファイル）の管理
 
-最初のアルバムは従来どおり video.db、追加したアルバムは albums/ フォルダに作成する
+アルバムのDBはすべて albums/ フォルダに作成する
 """
 import glob
 import json
 import os
 from datetime import datetime
 
-from db.connection import DEFAULT_DB_PATH, DBConnection
+from db.connection import DBConnection
 
 ALBUM_DIR = "albums"
 DEFAULT_ALBUM_NAME = "マイアルバム"
@@ -41,11 +41,8 @@ def _set_meta(key: str, value: str, db_path: str | None = None):
 
 def list_albums() -> list[tuple[str, str]]:
     """(DBパス, アルバム名) の一覧（作成順）"""
-    paths = [DEFAULT_DB_PATH] + sorted(glob.glob(os.path.join(ALBUM_DIR, "*.db")))
     albums = []
-    for path in paths:
-        if path != DEFAULT_DB_PATH and not os.path.exists(path):
-            continue
+    for path in sorted(glob.glob(os.path.join(ALBUM_DIR, "*.db"))):
         create_album_meta_table(path)
         albums.append((path, _get_meta("name", path) or DEFAULT_ALBUM_NAME))
     return albums

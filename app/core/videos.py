@@ -19,8 +19,8 @@ from PyQt6.QtWidgets import (
 
 from core.media import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, get_media_type, is_same_or_under
 from core.scanner import ScanWorker
-from db.albums import create_album, get_directories, list_albums, rename_album, set_directories
-from db.connection import DEFAULT_DB_PATH, get_db_path, set_db_path
+from db.albums import DEFAULT_ALBUM_NAME, create_album, get_directories, list_albums, rename_album, set_directories
+from db.connection import get_db_path, set_db_path
 from db.init import init_table
 from db.exclusions import add_excluded_paths, get_excluded_paths, remove_excluded_paths
 from db.tags import add_tag, remove_tag, rename_tags
@@ -259,8 +259,11 @@ class VideoTagApp(QMainWindow):
         self.scanning = False
 
         self._build_ui()
-        album = self.settings.value("album/current", DEFAULT_DB_PATH)
-        self.open_album(album if os.path.exists(album) else DEFAULT_DB_PATH)
+        albums = [path for path, _ in list_albums()]
+        album = self.settings.value("album/current", "")
+        if album not in albums:
+            album = albums[0] if albums else create_album(DEFAULT_ALBUM_NAME)  # アルバムが1つもなければ作る
+        self.open_album(album)
 
     # ------------------------------------------------------------------ UI
     def _build_ui(self):
@@ -270,11 +273,13 @@ class VideoTagApp(QMainWindow):
         self.album_combo.activated.connect(self.on_album_selected)
         self.album_menu_button = QToolButton()
         self.album_menu_button.setText("…")
-        self.album_menu_button.setToolTip("アルバムの作成・名前変更")
+        self.album_menu_button.setToolTip("アルバムの作成・名前変更・削除")
         self.album_menu_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         album_menu = QMenu(self)
         album_menu.addAction("新しいアルバム...", self.create_album)
         album_menu.addAction("アルバム名を変更...", self.rename_album)
+        album_menu.addSeparator()
+        self.delete_album_action = album_menu.addAction("アルバムを削除...", self.delete_album)
         self.album_menu_button.setMenu(album_menu)
 
         self.add_dir_button = QPushButton("フォルダを追加...")
@@ -475,8 +480,8 @@ class VideoTagApp(QMainWindow):
         """アルバム（DBファイル）を切り替えて一覧を読み込む"""
         set_db_path(path)
         init_table()
-        # 旧バージョンでアプリ設定に保存していた登録フォルダは、最初のアルバムへ移す
-        if path == DEFAULT_DB_PATH and self.settings.contains("directories"):
+        # 旧バージョンでアプリ設定に保存していた登録フォルダは、最初に開いたアルバムへ移す
+        if self.settings.contains("directories"):
             if not get_directories():
                 set_directories(self.settings.value("directories", [], type=list))
             self.settings.remove("directories")
@@ -494,6 +499,7 @@ class VideoTagApp(QMainWindow):
             if path == current:
                 self.album_combo.setCurrentIndex(self.album_combo.count() - 1)
                 self.setWindowTitle(f"動画タグ管理アプリ - {name}")
+        self.delete_album_action.setEnabled(self.album_combo.count() > 1)  # 最後の1つは削除できない
 
     def on_album_selected(self, index: int):
         path = self.album_combo.itemData(index)
@@ -515,6 +521,28 @@ class VideoTagApp(QMainWindow):
         if ok and name and name != current:
             rename_album(name)
             self.refresh_album_combo()
+
+    def delete_album(self):
+        """現在のアルバムのDBをごみ箱へ移し、別のアルバムを開く（登録していたファイル自体は削除しない）"""
+        if self.album_combo.count() <= 1:
+            return
+        current = self.album_combo.currentText()
+        answer = QMessageBox.question(
+            self, "アルバムを削除",
+            f"アルバム「{current}」を削除しますか？\n"
+            f"このアルバムのタグ・評価・登録フォルダ（{len(self.videos)} 件分）が失われます。\n"
+            "動画・画像ファイル自体は削除されません。\n"
+            "（アルバムのDBファイルはごみ箱へ移動します）",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        path = get_db_path()
+        if not QFile.moveToTrash(path)[0]:
+            QMessageBox.warning(self, "アルバムを削除", f"DBファイルを削除できませんでした:\n{os.path.abspath(path)}")
+            return
+        remaining = [p for p, _ in list_albums() if p != path]
+        self.open_album(remaining[0])
+        self.statusBar().showMessage(f"アルバム「{current}」を削除しました", 10000)
 
     # ---------------------------------------------------------------- データ
     def reload_from_db(self):

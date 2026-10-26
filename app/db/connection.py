@@ -1,8 +1,6 @@
 import sqlite3
 
-DEFAULT_DB_PATH = 'video.db'
-
-_db_path = DEFAULT_DB_PATH  # 現在開いているアルバムのDB
+_db_path: str | None = None  # 現在開いているアルバムのDB
 
 
 def set_db_path(path: str):
@@ -10,7 +8,7 @@ def set_db_path(path: str):
     _db_path = path
 
 
-def get_db_path() -> str:
+def get_db_path() -> str | None:
     return _db_path
 
 
