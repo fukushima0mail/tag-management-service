@@ -3,9 +3,10 @@ import os
 from PyQt6.QtCore import QThread, pyqtSignal
 
 from core.media import extension_tag, is_same_or_under, iter_media_files, load_media_info
+from db.albums import get_thumbnail_width
 from db.exclusions import get_excluded_paths
 from db.tags import add_tag
-from db.videos import add_video, delete_videos, get_video_index, rename_video
+from db.videos import add_video, delete_videos, get_outdated_thumbnail_ids, get_video_index, rename_video
 
 
 def _is_excluded(path: str, excluded: set[str]) -> bool:
@@ -49,6 +50,8 @@ class ScanWorker(QThread):
     def run(self):
         files = self._collect_files()
         index = get_video_index()
+        thumbnail_width = get_thumbnail_width()
+        outdated = get_outdated_thumbnail_ids(thumbnail_width)  # サムネイルサイズを変えた後のファイル
         added = updated = moved = 0
         missing = None  # (サイズ, 更新日時) -> 実ファイルが見つからない登録済みファイルの (パス, ID)
         scanned_ids = []
@@ -62,11 +65,11 @@ class ScanWorker(QThread):
             except OSError:
                 continue
 
-            # サイズ・更新日時が変わっていないファイルは再処理しない
+            # サイズ・更新日時が変わっておらず、サムネイルも今のサイズのファイルは再処理しない
             existing = index.get(path)
             if existing:
                 existing_id, size, mtime = existing
-                if size == stat.st_size and mtime == stat.st_mtime:
+                if size == stat.st_size and mtime == stat.st_mtime and existing_id not in outdated:
                     if not self.tag_new_only:
                         scanned_ids.append(existing_id)
                     continue
@@ -86,8 +89,8 @@ class ScanWorker(QThread):
                     moved += 1
                     continue
 
-            media_type, duration, thumbnail = load_media_info(path)
-            video_id = add_video(path, media_type, duration, thumbnail, stat.st_size, stat.st_mtime)
+            media_type, duration, thumbnail = load_media_info(path, thumbnail_width)
+            video_id = add_video(path, media_type, duration, thumbnail, stat.st_size, stat.st_mtime, thumbnail_width)
             add_tag([video_id], extension_tag(path))
             if not (existing and self.tag_new_only):
                 scanned_ids.append(video_id)

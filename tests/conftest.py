@@ -50,6 +50,10 @@ def window(qapp, tmp_path, monkeypatch):
     ini = str(tmp_path / "settings.ini")
     monkeypatch.setattr(cv, "QSettings", lambda *a: QSettings(ini, QSettings.Format.IniFormat))
     monkeypatch.setattr(cv.QMessageBox, "question", staticmethod(lambda *a, **k: QMessageBox.StandardButton.Yes))
+    # ファイル選択ダイアログでテストが止まらないよう、既定ではキャンセル扱いにする
+    for name in ("getExistingDirectory", "getOpenFileName", "getOpenFileNames", "getSaveFileName"):
+        cancelled = "" if name == "getExistingDirectory" else ([], "") if name == "getOpenFileNames" else ("", "")
+        monkeypatch.setattr(cv.QFileDialog, name, staticmethod(lambda *a, _r=cancelled, **k: _r))
     w = cv.VideoTagApp()
     yield w
     w.close()

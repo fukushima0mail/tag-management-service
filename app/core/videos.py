@@ -8,19 +8,26 @@ from PyQt6.QtCore import QFile, QSettings, QStringListModel, Qt, QUrl
 from PyQt6.QtGui import QDesktopServices, QIcon, QKeySequence, QPixmap, QShortcut
 from PyQt6.QtWidgets import (
     QApplication, QComboBox, QDialog, QFileDialog, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget,
-    QListWidgetItem, QMainWindow, QMenu, QMessageBox, QProgressBar, QPushButton, QSplitter, QStyle,
+    QListWidgetItem, QMainWindow, QMenu, QMessageBox, QProgressBar, QPushButton, QSlider, QSplitter, QStyle,
     QToolButton, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
+from core.folder_dialog import FolderDialog
 from core.formatting import (
     MAX_RATING, format_duration, format_mtime, format_rating, format_size, rating_stars,
 )
-from core.media import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, get_media_type, is_same_or_under
+from core.media import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, get_media_type, is_same_or_under, missing_drive
 from core.scanner import ScanWorker
 from core.tags import normalize_tag, split_tag
 from core.transfer import export_album, import_album
-from core.widgets import RATING_ROLE, AddTagsDialog, ThumbnailDelegate, ThumbnailGrid, make_tag_completer
-from db.albums import DEFAULT_ALBUM_NAME, create_album, get_directories, list_albums, rename_album, set_directories
+from core.widgets import (
+    CELL_WIDTH_STEP, DEFAULT_CELL_WIDTH, MAX_CELL_WIDTH, MIN_CELL_WIDTH, RATING_ROLE, AddTagsDialog,
+    ThumbnailDelegate, ThumbnailGrid, make_tag_completer,
+)
+from db.albums import (
+    DEFAULT_ALBUM_NAME, create_album, get_directories, get_grid_cell_width, get_thumbnail_width, list_albums,
+    rename_album, set_directories, set_grid_cell_width, set_thumbnail_width,
+)
 from db.connection import get_db_path, set_db_path
 from db.init import init_table
 from db.exclusions import add_excluded_paths, get_excluded_paths, remove_excluded_paths
@@ -38,6 +45,8 @@ SORT_KEYS = {
 }
 TYPE_FILTERS = {"すべて": None, "動画": "video", "画像": "image"}
 TYPE_LABELS = {"video": "動画", "image": "画像"}
+# サムネイルサイズの選択肢（表示名 -> 幅。高さは 16:9）
+THUMBNAIL_WIDTHS = {"小 (240px)": 240, "標準 (320px)": 320, "大 (480px)": 480, "特大 (640px)": 640}
 INVALID_FILENAME_CHARS = '\\/:*?"<>|'
 GROUP_ROLE = Qt.ItemDataRole.UserRole + 2   # タグ絞り込みツリーのグループ見出しに持たせるグループ名
 
@@ -76,6 +85,7 @@ class VideoTagApp(QMainWindow):
         album_menu = QMenu(self)
         album_menu.addAction("新しいアルバム...", self.create_album)
         album_menu.addAction("アルバム名を変更...", self.rename_album)
+        album_menu.addAction("サムネイルサイズ...", self.change_thumbnail_size)
         album_menu.addSeparator()
         album_menu.addAction("タグ・評価をエクスポート...", self.export_tags)
         album_menu.addAction("タグ・評価をインポート...", self.import_tags)
@@ -89,6 +99,9 @@ class VideoTagApp(QMainWindow):
         self.rescan_button.clicked.connect(self.rescan_all)
         self.exclude_dir_button = QPushButton("フォルダを除外...")
         self.exclude_dir_button.clicked.connect(self.exclude_directory)
+        self.folders_button = QPushButton("フォルダ一覧...")
+        self.folders_button.setToolTip("登録フォルダと、除外したフォルダ・ファイルの一覧")
+        self.folders_button.clicked.connect(self.show_folders)
         self.add_files_button = QPushButton("ファイルを追加...")
         self.add_files_button.clicked.connect(self.choose_files)
 
@@ -109,6 +122,17 @@ class VideoTagApp(QMainWindow):
         self.order_combo.addItems(["昇順", "降順"])
         self.order_combo.currentIndexChanged.connect(self.apply_filters)
 
+        # 一覧に並ぶサムネイルの大きさ（アルバムごとに保存。Ctrl+ホイールでも変更できる）
+        self.cell_size_slider = QSlider(Qt.Orientation.Horizontal)
+        self.cell_size_slider.setRange(MIN_CELL_WIDTH, MAX_CELL_WIDTH)
+        self.cell_size_slider.setSingleStep(CELL_WIDTH_STEP)
+        self.cell_size_slider.setPageStep(CELL_WIDTH_STEP * 2)
+        self.cell_size_slider.setValue(DEFAULT_CELL_WIDTH)
+        self.cell_size_slider.setFixedWidth(120)
+        self.cell_size_slider.setToolTip("一覧に並ぶサムネイルの大きさ（一覧上で Ctrl+ホイールでも変更できます）")
+        self.cell_size_slider.valueChanged.connect(self.on_cell_size_changed)
+        self.cell_size_slider.sliderReleased.connect(lambda: set_grid_cell_width(self.cell_size_slider.value()))
+
         # 1段目: ファイル操作・表示切り替え
         # （最小化したパネルは「絞り込み」「ファイル情報」から再表示）
         self.filter_toggle = QPushButton("絞り込み")
@@ -126,6 +150,7 @@ class VideoTagApp(QMainWindow):
         operation_row.addWidget(self.add_files_button)
         operation_row.addWidget(self.rescan_button)
         operation_row.addWidget(self.exclude_dir_button)
+        operation_row.addWidget(self.folders_button)
         operation_row.addStretch(1)
         operation_row.addWidget(QLabel("表示:"))
         operation_row.addWidget(self.filter_toggle)
@@ -140,6 +165,8 @@ class VideoTagApp(QMainWindow):
         search_row.addWidget(QLabel("並び替え:"))
         search_row.addWidget(self.sort_combo)
         search_row.addWidget(self.order_combo)
+        search_row.addWidget(QLabel("表示サイズ:"))
+        search_row.addWidget(self.cell_size_slider)
 
         top = QVBoxLayout()
         top.addLayout(operation_row)
@@ -170,6 +197,9 @@ class VideoTagApp(QMainWindow):
         # 中央: サムネイル一覧
         self.grid = ThumbnailGrid()
         self.grid.setItemDelegate(ThumbnailDelegate(self.grid))
+        self.grid.zoom_requested.connect(
+            lambda steps: self.cell_size_slider.setValue(self.cell_size_slider.value() + steps * CELL_WIDTH_STEP)
+        )
         self.grid.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
         self.grid.itemSelectionChanged.connect(self.update_detail)
         self.grid.itemDoubleClicked.connect(
@@ -280,7 +310,7 @@ class VideoTagApp(QMainWindow):
         # スキャン中は操作できないようにするもの（DBの登録内容やアルバムを変える操作）
         self.scan_locked_widgets = (
             self.add_files_button, self.add_dir_button, self.rescan_button, self.exclude_dir_button,
-            self.album_combo, self.album_menu_button,
+            self.folders_button, self.album_combo, self.album_menu_button,
         )
 
     # -------------------------------------------------------------- アルバム
@@ -296,6 +326,10 @@ class VideoTagApp(QMainWindow):
         self.settings.setValue("album/current", path)
         self.icons.clear()
         self.grid.clearSelection()
+        self.cell_size_slider.blockSignals(True)
+        self.cell_size_slider.setValue(get_grid_cell_width() or DEFAULT_CELL_WIDTH)
+        self.cell_size_slider.blockSignals(False)
+        self.grid.set_cell_width(self.cell_size_slider.value())
         self.refresh_album_combo()
         self.reload_from_db()
 
@@ -351,6 +385,36 @@ class VideoTagApp(QMainWindow):
         remaining = [p for p, _ in list_albums() if p != path]
         self.open_album(remaining[0])
         self.statusBar().showMessage(f"アルバム「{current}」を削除しました", 10000)
+
+    def on_cell_size_changed(self, width: int):
+        self.grid.set_cell_width(width)
+        # ドラッグ中は離したときにまとめて保存する（キーボード・ホイールでの変更はその都度保存）
+        if not self.cell_size_slider.isSliderDown():
+            set_grid_cell_width(width)
+
+    def change_thumbnail_size(self):
+        """このアルバムで作るサムネイルの大きさを変える（既存のサムネイルは再スキャンで作り直す）"""
+        current = get_thumbnail_width()
+        labels = list(THUMBNAIL_WIDTHS)
+        index = next((i for i, w in enumerate(THUMBNAIL_WIDTHS.values()) if w == current), 1)
+        label, ok = QInputDialog.getItem(
+            self, "サムネイルサイズ",
+            f"アルバム「{self.album_combo.currentText()}」のサムネイルの大きさ\n"
+            "（大きいほど拡大表示がきれいになりますが、DBのサイズと読み込み時間が増えます）",
+            labels, index, False,
+        )
+        if not ok or THUMBNAIL_WIDTHS[label] == current:
+            return
+        set_thumbnail_width(THUMBNAIL_WIDTHS[label])
+        answer = QMessageBox.question(
+            self, "サムネイルサイズ",
+            f"サムネイルサイズを「{label}」にしました。\n"
+            "登録済みのサムネイルは再スキャンで作り直されます。今すぐ再スキャンしますか？",
+        )
+        if answer == QMessageBox.StandardButton.Yes:
+            self.rescan_all()
+        else:
+            self.statusBar().showMessage(f"サムネイルサイズを「{label}」にしました（次回の再スキャンで作り直します）", 10000)
 
     def export_tags(self):
         album = self.album_combo.currentText()
@@ -739,7 +803,10 @@ class VideoTagApp(QMainWindow):
         )
         if not directory:
             return
-        directory = os.path.normpath(directory)
+        self.exclude_directory_path(os.path.normpath(directory))
+
+    def exclude_directory_path(self, directory: str) -> bool:
+        """フォルダ内のファイルをDBから除外し、再スキャンでも読み込まないよう記録する（キャンセル時は False）"""
         ids = [v["id"] for v in self.videos if is_same_or_under(v["file_path"], directory)]
         answer = QMessageBox.question(
             self, "フォルダを除外",
@@ -748,17 +815,20 @@ class VideoTagApp(QMainWindow):
             "（再スキャンでは再登録されません。フォルダを追加し直すと再登録されます）",
         )
         if answer != QMessageBox.StandardButton.Yes:
-            return
+            return False
 
         # 除外フォルダ自身・配下の登録フォルダはスキャン対象から外す
-        remaining = [d for d in directories if not is_same_or_under(d, directory)]
-        set_directories(remaining)
-        # 登録フォルダの一部だけを除外する場合は、再スキャンで再登録されないよう記録する
-        if any(is_same_or_under(directory, d) for d in remaining):
-            add_excluded_paths([directory])
+        set_directories([d for d in get_directories() if not is_same_or_under(d, directory)])
+        # 除外一覧に表示し、別の登録フォルダ経由でも再登録されないよう記録する
+        add_excluded_paths([directory])
         delete_videos(ids)
         self.statusBar().showMessage(f"{directory} 内の {len(ids)} 件をDBから除外しました", 10000)
         self.reload_from_db()
+        return True
+
+    def show_folders(self):
+        if not self.scanning:
+            FolderDialog(self).exec()
 
     def clear_tag_filter(self):
         self.tag_filter_list.blockSignals(True)
@@ -802,10 +872,16 @@ class VideoTagApp(QMainWindow):
 
     def rescan_all(self):
         directories = get_directories()
-        if directories:
-            self.start_scan(directories)
-        else:
+        if not directories:
             self.choose_directory()
+            return
+        if not any(os.path.isdir(d) for d in directories):
+            drives = sorted({d for d in map(missing_drive, directories) if d})
+            reason = (f"{'、'.join(drives)} ドライブが見つかりません。\nドライブを接続してから再スキャンしてください。"
+                      if drives else "登録フォルダが1つも見つかりません。\n「フォルダ一覧...」で登録フォルダを確認してください。")
+            QMessageBox.warning(self, "再スキャン", f"{reason}\n（登録済みのファイル・タグはそのまま残っています）")
+            return
+        self.start_scan(directories)
 
     def start_scan(self, directories: list[str], tags: list[str] | None = None, files: list[str] | None = None,
                    tag_new_only: bool = False):

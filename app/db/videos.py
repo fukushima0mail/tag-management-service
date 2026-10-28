@@ -1,3 +1,4 @@
+from core.media import DEFAULT_THUMBNAIL_WIDTH
 from db.connection import DBConnection
 from db.tags import delete_unused_tags, get_tags_by_video
 
@@ -14,7 +15,8 @@ def create_videos_table():
                 media_type TEXT NOT NULL DEFAULT 'video',
                 file_size INTEGER,
                 modified_at REAL,
-                rating INTEGER NOT NULL DEFAULT 0
+                rating INTEGER NOT NULL DEFAULT 0,
+                thumbnail_width INTEGER
             )
         """)
 
@@ -26,27 +28,36 @@ def create_videos_table():
             ("file_size", "INTEGER"),
             ("modified_at", "REAL"),
             ("rating", "INTEGER NOT NULL DEFAULT 0"),
+            ("thumbnail_width", "INTEGER"),  # サムネイルを作ったときの幅（NULL は既定の幅）
         ):
             if name not in columns:
                 c.execute(f"ALTER TABLE videos ADD COLUMN {name} {definition}")
 
 
 def add_video(file_path: str, media_type: str, duration: float | None, thumbnail: bytes | None,
-              file_size: int, modified_at: float) -> int:
+              file_size: int, modified_at: float, thumbnail_width: int = DEFAULT_THUMBNAIL_WIDTH) -> int:
     """動画・画像を登録（登録済みなら更新）し、IDを返す"""
     with DBConnection() as c:
         c.execute("""
-            INSERT INTO videos (file_path, media_type, duration, thumbnail, file_size, modified_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO videos (file_path, media_type, duration, thumbnail, file_size, modified_at, thumbnail_width)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(file_path) DO UPDATE SET
                 media_type = excluded.media_type,
                 duration = excluded.duration,
                 thumbnail = excluded.thumbnail,
                 file_size = excluded.file_size,
-                modified_at = excluded.modified_at
+                modified_at = excluded.modified_at,
+                thumbnail_width = excluded.thumbnail_width
             RETURNING id
-        """, (file_path, media_type, duration, thumbnail, file_size, modified_at))
+        """, (file_path, media_type, duration, thumbnail, file_size, modified_at, thumbnail_width))
         return c.fetchone()[0]
+
+
+def get_outdated_thumbnail_ids(width: int) -> set[int]:
+    """サムネイルの幅が width と異なる（作り直しが必要な）ファイルのID"""
+    with DBConnection() as c:
+        c.execute("SELECT id FROM videos WHERE COALESCE(thumbnail_width, ?) != ?", (DEFAULT_THUMBNAIL_WIDTH, width))
+        return {row[0] for row in c.fetchall()}
 
 
 def delete_videos(video_ids: list[int]):

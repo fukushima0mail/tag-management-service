@@ -24,6 +24,7 @@ def answer_input(monkeypatch, text: str):
 
 @pytest.fixture
 def scanned(window, qapp, media_dir):
+    cv.set_directories([str(media_dir)])
     scan_and_wait(window, qapp, [media_dir], ["旅行", "年代:2020"])
     return window
 
@@ -196,3 +197,104 @@ def test_export_import_via_menu(scanned, monkeypatch, tmp_path):
     scanned.import_tags()
     assert all(v["rating"] == 6 for v in scanned.videos)
     assert "3 件" in infos[0][2]
+
+
+# ---------------------------------------------------------------- フォルダの除外・一覧
+def test_excluded_subfolder_is_not_rescanned(scanned, qapp, media_dir):
+    assert scanned.exclude_directory_path(str(media_dir / "sub"))
+    assert len(scanned.videos) == 2
+    scanned.rescan_all()
+    scanned.scan_worker.wait()
+    qapp.processEvents()
+    assert sorted(os.path.basename(v["file_path"]) for v in scanned.videos) == ["a.jpg", "b.png"]
+
+
+def test_excluded_registered_folder_is_listed_and_not_rescanned(window, qapp, media_dir, monkeypatch):
+    cv.set_directories([str(media_dir)])
+    window.rescan_all()
+    window.scan_worker.wait()
+    qapp.processEvents()
+    assert len(window.videos) == 3
+
+    assert window.exclude_directory_path(str(media_dir))
+    assert cv.get_directories() == []
+    assert cv.get_excluded_paths() == [str(media_dir)]
+
+    # 親フォルダを登録して再スキャンしても、除外したフォルダは読み込まれない
+    cv.set_directories([str(media_dir.parent)])
+    window.rescan_all()
+    window.scan_worker.wait()
+    qapp.processEvents()
+    assert window.videos == []
+
+
+def test_folder_dialog_lists_and_unexcludes(scanned, qapp, media_dir, tmp_path):
+    from core.folder_dialog import FolderDialog
+
+    scanned.exclude_directory_path(str(media_dir / "sub"))
+    cv.set_directories([str(media_dir), str(tmp_path / "unplugged")])
+    dialog = FolderDialog(scanned)
+
+    texts = [dialog.directory_list.item(i).text() for i in range(dialog.directory_list.count())]
+    assert f"{media_dir}  (2 件)" in texts
+    assert any("見つかりません" in t for t in texts)
+    assert dialog.excluded_list.count() == 1
+    assert not dialog.unexclude_button.isEnabled()
+
+    dialog.excluded_list.item(0).setSelected(True)
+    dialog._unexclude_selected()
+    assert dialog.excluded_list.count() == 0
+
+    scanned.rescan_all()
+    scanned.scan_worker.wait()
+    qapp.processEvents()
+    assert len(scanned.videos) == 3  # 除外を解除すると再スキャンで読み込まれる
+
+
+def test_folder_dialog_unregister_keeps_files(scanned, qapp, media_dir):
+    from core.folder_dialog import FolderDialog
+
+    dialog = FolderDialog(scanned)
+    dialog.directory_list.item(0).setSelected(True)
+    dialog._unregister_selected()
+    assert dialog.directory_list.count() == 0
+    assert dialog.excluded_list.count() == 0  # 除外ではないので除外一覧には出ない
+    assert cv.get_directories() == []
+
+    scanned.reload_from_db()
+    assert len(scanned.videos) == 3  # DBからは削除しない
+
+    # 対象外になったフォルダの変更は反映されない（消えたファイルもDBに残る）
+    (media_dir / "a.jpg").unlink()
+    cv.set_directories([str(media_dir.parent / "other")])
+    (media_dir.parent / "other").mkdir()
+    scanned.rescan_all()
+    scanned.scan_worker.wait()
+    qapp.processEvents()
+    assert len(scanned.videos) == 3
+
+
+@pytest.mark.skipif(os.name != "nt", reason="ドライブ文字は Windows のみ")
+def test_missing_drive_is_reported(scanned, monkeypatch):
+    import string
+    from core.folder_dialog import FolderDialog
+
+    drive = next(f"{d}:" for d in reversed(string.ascii_uppercase) if not os.path.exists(f"{d}:\\"))
+    cv.set_directories([os.path.join(drive + os.sep, "videos", year) for year in ("2019", "2020")])
+    dialog = FolderDialog(scanned)
+    assert dialog.drive_warning.isVisibleTo(dialog)
+    assert f"{drive} ドライブが見つかりません" in dialog.drive_warning.text()
+    assert all(f"{drive} ドライブが未接続" in dialog.directory_list.item(i).text()
+               for i in range(dialog.directory_list.count()))
+
+    # すべての登録フォルダが見つからなければ、再スキャンせずに知らせる
+    warnings = []
+    monkeypatch.setattr(cv.QMessageBox, "warning", staticmethod(lambda *a, **k: warnings.append(a[2])))
+    scanned.rescan_all()
+    assert not scanned.scanning
+    assert f"{drive} ドライブが見つかりません" in warnings[0]
+
+
+def test_no_drive_warning_when_folders_exist(scanned):
+    from core.folder_dialog import FolderDialog
+    assert not FolderDialog(scanned).drive_warning.isVisibleTo(scanned)

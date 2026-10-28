@@ -7,6 +7,7 @@ import json
 import os
 from datetime import datetime
 
+from core.media import DEFAULT_THUMBNAIL_WIDTH
 from db.connection import DBConnection
 
 ALBUM_DIR = "albums"
@@ -75,3 +76,23 @@ def get_directories() -> list[str]:
 
 def set_directories(directories: list[str]):
     _set_meta("directories", json.dumps(directories, ensure_ascii=False))
+
+
+def get_thumbnail_width() -> int:
+    """現在のアルバムで作るサムネイルの幅"""
+    value = _get_meta("thumbnail_width")
+    return int(value) if value else DEFAULT_THUMBNAIL_WIDTH
+
+
+def set_thumbnail_width(width: int):
+    _set_meta("thumbnail_width", str(width))
+
+
+def get_grid_cell_width() -> int | None:
+    """現在のアルバムの一覧のセル幅（未設定なら None）"""
+    value = _get_meta("grid_cell_width")
+    return int(value) if value else None
+
+
+def set_grid_cell_width(width: int):
+    _set_meta("grid_cell_width", str(width))

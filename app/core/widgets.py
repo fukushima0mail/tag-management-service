@@ -1,5 +1,5 @@
-from PyQt6.QtCore import QRect, QSize, QStringListModel, Qt
-from PyQt6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPalette, QPen
+from PyQt6.QtCore import QRect, QSize, QStringListModel, Qt, pyqtSignal
+from PyQt6.QtGui import QColor, QFont, QFontMetrics, QIcon, QPainter, QPalette, QPen
 from PyQt6.QtWidgets import (
     QCheckBox, QCompleter, QDialog, QDialogButtonBox, QLabel, QLineEdit, QListWidget, QStyle,
     QStyledItemDelegate, QStyleOptionViewItem, QVBoxLayout,
@@ -8,8 +8,10 @@ from PyQt6.QtWidgets import (
 from core.formatting import MAX_RATING
 from core.tags import parse_tags
 
-MAX_COLUMNS = 8         # 1行に並べるサムネイルの最大数
-MIN_CELL_WIDTH = 140    # これより狭くなる場合は列数を減らす
+DEFAULT_CELL_WIDTH = 160  # 一覧のセル幅の目安（これより狭くなる場合は列数を減らす）
+MIN_CELL_WIDTH = 100
+MAX_CELL_WIDTH = 640
+CELL_WIDTH_STEP = 20      # Ctrl+ホイール1段で変える幅
 CELL_PADDING = 20       # セル幅とサムネイル幅の差
 LABEL_HEIGHT = 45       # ファイル名（2行）の表示領域
 RATING_ROLE = Qt.ItemDataRole.UserRole + 1  # サムネイル一覧の各項目に持たせる評価
@@ -19,7 +21,18 @@ SELECTION_BORDER_WIDTH = 4
 
 
 class ThumbnailDelegate(QStyledItemDelegate):
-    """サムネイルの描画: 選択中の強調表示と、評価の★を重ねて描く"""
+    """サムネイルの描画: セルに合わせた拡大縮小、選択中の強調表示と、評価の★を重ねて描く"""
+
+    _hide_icon = False
+
+    def initStyleOption(self, option, index):
+        super().initStyleOption(option, index)
+        # 標準では描画枠が元画像の大きさまでに縮められるので、一覧のサムネイルサイズに揃える
+        if option.widget is not None:
+            option.decorationSize = option.widget.iconSize()
+        if self._hide_icon:
+            # 配置（ファイル名の位置）はそのままに、標準のアイコン描画だけを止める
+            option.icon = QIcon()
 
     def paint(self, painter, option, index):
         opt = QStyleOptionViewItem(option)
@@ -33,14 +46,33 @@ class ThumbnailDelegate(QStyledItemDelegate):
             painter.fillRect(text_rect, QColor(accent.red(), accent.green(), accent.blue(), 70))
         base = QStyleOptionViewItem(option)
         base.state &= ~QStyle.StateFlag.State_Selected
-        super().paint(painter, base, index)
+        self._hide_icon = True
+        try:
+            super().paint(painter, base, index)
+        finally:
+            self._hide_icon = False
 
         icon_rect = style.subElementRect(QStyle.SubElement.SE_ItemViewItemDecoration, opt, opt.widget)
+        self._paint_thumbnail(painter, opt.icon, icon_rect)
         rating = index.data(RATING_ROLE)
         if rating:
             self._paint_rating(painter, opt, icon_rect, rating)
         if selected:
             self._paint_selection(painter, icon_rect, accent)
+
+    @staticmethod
+    def _paint_thumbnail(painter, icon: QIcon, rect: QRect):
+        """サムネイルを縦横比を保ってセルいっぱいに描く（標準の描画は元画像より大きく拡大しないため）"""
+        sizes = icon.availableSizes()
+        if not sizes:
+            return
+        pixmap = icon.pixmap(max(sizes, key=lambda s: s.width() * s.height()))
+        if pixmap.width() >= 64:  # 小さなアイコン（読み込み前の仮アイコン）は拡大しない
+            pixmap = pixmap.scaled(rect.size(), Qt.AspectRatioMode.KeepAspectRatio,
+                                   Qt.TransformationMode.SmoothTransformation)
+        x = rect.left() + (rect.width() - pixmap.width()) // 2
+        y = rect.top() + (rect.height() - pixmap.height()) // 2
+        painter.drawPixmap(x, y, pixmap)
 
     @staticmethod
     def _paint_rating(painter, opt, icon_rect: QRect, rating: int):
@@ -90,7 +122,9 @@ class ThumbnailDelegate(QStyledItemDelegate):
 
 
 class ThumbnailGrid(QListWidget):
-    """幅に合わせてセルサイズを調整し、1行に最大 MAX_COLUMNS 枚並べるサムネイル一覧"""
+    """幅に合わせてセルサイズを調整するサムネイル一覧（セル幅の目安は cell_width で変えられる）"""
+
+    zoom_requested = pyqtSignal(int)  # Ctrl+ホイールの回転量（+1 で拡大、-1 で縮小）
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -100,7 +134,21 @@ class ThumbnailGrid(QListWidget):
         self.setUniformItemSizes(True)
         self.setWordWrap(True)
         self.show_labels = True
+        self.cell_width = DEFAULT_CELL_WIDTH
         self._fit_cells()
+
+    def set_cell_width(self, width: int):
+        self.cell_width = max(MIN_CELL_WIDTH, min(MAX_CELL_WIDTH, width))
+        self._fit_cells()
+
+    def wheelEvent(self, event):
+        if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            steps = event.angleDelta().y() // 120
+            if steps:
+                self.zoom_requested.emit(steps)
+            event.accept()
+            return
+        super().wheelEvent(event)
 
     def set_show_labels(self, show: bool):
         """ファイル名を非表示にした場合は、その分セルの高さを詰める"""
@@ -115,7 +163,7 @@ class ThumbnailGrid(QListWidget):
         # スクロールバーの表示有無で列数が揺れないよう、常にその幅を差し引いて計算する
         scrollbar = self.style().pixelMetric(QStyle.PixelMetric.PM_ScrollBarExtent)
         width = max(self.contentsRect().width() - scrollbar, MIN_CELL_WIDTH)
-        columns = max(1, min(MAX_COLUMNS, width // MIN_CELL_WIDTH))
+        columns = max(1, width // self.cell_width)
         cell_width = width // columns
         icon = QSize(cell_width - CELL_PADDING, (cell_width - CELL_PADDING) * 9 // 16)
         grid = QSize(cell_width, icon.height() + (LABEL_HEIGHT if self.show_labels else CELL_PADDING))

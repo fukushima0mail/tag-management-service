@@ -17,7 +17,7 @@ VIDEO_EXTENSIONS = {
 IMAGE_EXTENSIONS = {
     ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tif", ".tiff",
 }
-THUMBNAIL_SIZE = (320, 180)
+DEFAULT_THUMBNAIL_WIDTH = 320  # サムネイルの幅（高さは 16:9 の枠に収める）
 # pythonw.exe（コンソールなし）で起動した場合に、ffmpeg 実行のたびにコンソール画面が開かないようにする
 NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
 
@@ -54,6 +54,12 @@ def is_same_or_under(path: str, directory: str) -> bool:
     return path == directory or path.startswith(os.path.join(directory, ""))
 
 
+def missing_drive(path: str) -> str | None:
+    """path のドライブ（例: W:）自体が見つからなければそのドライブ名を返す（外付け・ネットワークドライブの未接続など）"""
+    drive = os.path.splitdrive(os.path.abspath(path))[0]
+    return drive if drive and not os.path.exists(drive + os.sep) else None
+
+
 def iter_media_files(directory: str):
     """ディレクトリ配下（サブフォルダ含む）の動画・画像ファイルを列挙"""
     for root, _, files in os.walk(directory):
@@ -63,13 +69,18 @@ def iter_media_files(directory: str):
                 yield path
 
 
-def load_media_info(file_path: str) -> tuple[str, float | None, bytes | None]:
+def thumbnail_box(width: int) -> tuple[int, int]:
+    """サムネイルを収める枠（幅 x 16:9 の高さ）"""
+    return width, width * 9 // 16
+
+
+def load_media_info(file_path: str, thumbnail_width: int = DEFAULT_THUMBNAIL_WIDTH) -> tuple[str, float | None, bytes | None]:
     """(メディア種別, 再生時間, サムネイルJPEG) を返す"""
     media_type = get_media_type(file_path)
     if media_type == "video":
         duration = get_video_duration(file_path)
-        return media_type, duration, generate_video_thumbnail(file_path, duration)
-    return media_type, None, generate_image_thumbnail(file_path)
+        return media_type, duration, generate_video_thumbnail(file_path, duration, thumbnail_width)
+    return media_type, None, generate_image_thumbnail(file_path, thumbnail_width)
 
 
 def get_video_duration(file_path: str) -> float | None:
@@ -84,7 +95,8 @@ def get_video_duration(file_path: str) -> float | None:
         return None
 
 
-def generate_video_thumbnail(file_path: str, duration: float | None) -> bytes | None:
+def generate_video_thumbnail(file_path: str, duration: float | None,
+                             width: int = DEFAULT_THUMBNAIL_WIDTH) -> bytes | None:
     """ffmpegで動画のフレームを取得し、サムネイルJPEGとして返す"""
     if ffmpeg is None:
         return None
@@ -100,25 +112,25 @@ def generate_video_thumbnail(file_path: str, duration: float | None) -> bytes | 
         )
         if not out:
             return None
-        return _to_thumbnail_bytes(Image.open(io.BytesIO(out)))
+        return _to_thumbnail_bytes(Image.open(io.BytesIO(out)), width)
     except Exception as e:
         print(f"サムネイル生成エラー ({file_path}): {e}")
         return None
 
 
-def generate_image_thumbnail(file_path: str) -> bytes | None:
+def generate_image_thumbnail(file_path: str, width: int = DEFAULT_THUMBNAIL_WIDTH) -> bytes | None:
     """画像ファイルからサムネイルJPEGを生成"""
     try:
         with Image.open(file_path) as img:
-            return _to_thumbnail_bytes(ImageOps.exif_transpose(img))
+            return _to_thumbnail_bytes(ImageOps.exif_transpose(img), width)
     except Exception as e:
         print(f"サムネイル生成エラー ({file_path}): {e}")
         return None
 
 
-def _to_thumbnail_bytes(img: Image.Image) -> bytes:
+def _to_thumbnail_bytes(img: Image.Image, width: int) -> bytes:
     img = img.convert("RGB")
-    img.thumbnail(THUMBNAIL_SIZE)
+    img.thumbnail(thumbnail_box(width))
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=85)
     return buf.getvalue()

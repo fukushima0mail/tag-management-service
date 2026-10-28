@@ -5,7 +5,7 @@ import pytest
 from PIL import Image
 
 from core.media import (
-    extension_tag, generate_image_thumbnail, get_media_type, is_same_or_under, iter_media_files,
+    extension_tag, generate_image_thumbnail, get_media_type, is_same_or_under, iter_media_files, missing_drive,
     load_media_info,
 )
 
@@ -58,3 +58,15 @@ def test_load_media_info_image(media_dir):
     assert media_type == "image"
     assert duration is None
     assert thumbnail
+
+
+def _unused_drive() -> str:
+    import string
+    return next(f"{d}:" for d in reversed(string.ascii_uppercase) if not os.path.exists(f"{d}:\\"))
+
+
+@pytest.mark.skipif(os.name != "nt", reason="ドライブ文字は Windows のみ")
+def test_missing_drive(tmp_path):
+    drive = _unused_drive()
+    assert missing_drive(os.path.join(drive + os.sep, "videos", "2020")) == drive
+    assert missing_drive(str(tmp_path / "no_such_folder")) is None  # ドライブはある
