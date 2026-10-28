@@ -53,6 +53,36 @@ def add_video(file_path: str, media_type: str, duration: float | None, thumbnail
         return c.fetchone()[0]
 
 
+def add_videos(entries: list[tuple]) -> list[int]:
+    """スキャン結果をまとめて登録（登録済みなら更新）し、IDを返す（1回の接続・トランザクションで行う）
+
+    entries: (file_path, media_type, duration, thumbnail, file_size, modified_at, thumbnail_width, extension_tag)
+    """
+    ids = []
+    with DBConnection() as c:
+        for path, media_type, duration, thumbnail, size, mtime, width, ext_tag in entries:
+            c.execute("""
+                INSERT INTO videos (file_path, media_type, duration, thumbnail, file_size, modified_at, thumbnail_width)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(file_path) DO UPDATE SET
+                    media_type = excluded.media_type,
+                    duration = excluded.duration,
+                    thumbnail = excluded.thumbnail,
+                    file_size = excluded.file_size,
+                    modified_at = excluded.modified_at,
+                    thumbnail_width = excluded.thumbnail_width
+                RETURNING id
+            """, (path, media_type, duration, thumbnail, size, mtime, width))
+            video_id = c.fetchone()[0]
+            c.execute("INSERT OR IGNORE INTO tags (name) VALUES (?)", (ext_tag,))
+            c.execute(
+                "INSERT OR IGNORE INTO video_tags (video_id, tag_id) SELECT ?, id FROM tags WHERE name = ?",
+                (video_id, ext_tag),
+            )
+            ids.append(video_id)
+    return ids
+
+
 def get_outdated_thumbnail_ids(width: int) -> set[int]:
     """サムネイルの幅が width と異なる（作り直しが必要な）ファイルのID"""
     with DBConnection() as c:

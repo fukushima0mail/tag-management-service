@@ -170,3 +170,48 @@ def test_interrupted_scan_does_not_remove_files(album, media_dir):
     worker.run()
     assert result == [(0, 0, 0, 0)]
     assert "b.png" in videos_by_name()  # 中止時は削除しない
+
+
+# ---------------------------------------------------------------- 並列化・まとめて書き込み
+@pytest.fixture
+def many_media(tmp_path):
+    from PIL import Image
+    root = tmp_path / "many"
+    root.mkdir()
+    for i in range(60):
+        Image.new("RGB", (64 + i, 48), (i * 4, 0, 0)).save(root / f"{i:03}.jpg")
+    return root
+
+
+def test_parallel_scan_registers_everything(album, many_media, monkeypatch):
+    import core.scanner as scanner
+    monkeypatch.setattr(scanner, "WRITE_BATCH_SIZE", 7)  # 端数のある件数でまとめて書き込む
+    progress = []
+    worker = ScanWorker([str(many_media)], ["一括"])
+    result = []
+    worker.progress.connect(lambda done, total, path: progress.append((done, total)))
+    worker.scan_finished.connect(lambda *counts: result.append(counts))
+    worker.run()
+
+    assert result == [(60, 0, 0, 0)]
+    videos = get_all_videos()
+    assert len(videos) == 60
+    assert all({"一括", "拡張子:jpg"} <= set(v["tags"]) for v in videos)
+    assert all(v["file_size"] for v in videos)
+    assert [d for d, _ in progress] == list(range(1, 61))  # 進捗は1件ずつ進む
+    assert {t for _, t in progress} == {60}
+
+
+def test_interrupt_during_thumbnail_creation_keeps_finished(album, many_media):
+    worker = ScanWorker([str(many_media)])
+    result = []
+    worker.scan_finished.connect(lambda *counts: result.append(counts))
+    # 10 件処理したところで中止ボタンが押された状態にする
+    worker.progress.connect(lambda done, total, path: done >= 10 and setattr(worker, "_stop", True))
+    worker.isInterruptionRequested = lambda: getattr(worker, "_stop", False)
+    worker.run()
+
+    added = result[0][0]
+    assert 10 <= added < 60                      # 作成済みの分は登録される
+    assert len(get_all_videos()) == added
+    assert scan([many_media]) == (60 - added, 0, 0, 0)  # 続きは次のスキャンで登録される

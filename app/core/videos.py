@@ -1,38 +1,45 @@
 import os
+import sqlite3
 import subprocess
 import sys
 from collections import Counter
 from urllib.parse import quote_plus
 
 from PyQt6.QtCore import QFile, QSettings, QStringListModel, Qt, QUrl
-from PyQt6.QtGui import QDesktopServices, QIcon, QKeySequence, QPixmap, QShortcut
+from PyQt6.QtGui import QBrush, QColor, QDesktopServices, QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
-    QApplication, QComboBox, QDialog, QFileDialog, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget,
-    QListWidgetItem, QMainWindow, QMenu, QMessageBox, QProgressBar, QPushButton, QSlider, QSplitter, QStyle,
+    QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget,
+    QListWidgetItem, QMainWindow, QMenu, QMessageBox, QProgressBar, QProgressDialog, QPushButton, QSlider, QSplitter,
     QToolButton, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
+from core.duplicate_dialog import DuplicateDialog
+from core.duplicates import DuplicateWorker
 from core.folder_dialog import FolderDialog
 from core.formatting import (
     MAX_RATING, format_duration, format_mtime, format_rating, format_size, rating_stars,
 )
-from core.media import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, get_media_type, is_same_or_under, missing_drive
+from core.media import (
+    EXTENSION_TAG_GROUP, IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, get_media_type, is_same_or_under, missing_drive,
+)
 from core.scanner import ScanWorker
 from core.tags import normalize_tag, split_tag
 from core.transfer import export_album, import_album
+from core.thumbnail_model import ID_ROLE
 from core.widgets import (
-    CELL_WIDTH_STEP, DEFAULT_CELL_WIDTH, MAX_CELL_WIDTH, MIN_CELL_WIDTH, RATING_ROLE, AddTagsDialog,
-    ThumbnailDelegate, ThumbnailGrid, make_tag_completer,
+    CELL_WIDTH_STEP, DEFAULT_CELL_WIDTH, MAX_CELL_WIDTH, MIN_CELL_WIDTH, AddTagsDialog, ThumbnailDelegate,
+    ThumbnailGrid, make_tag_completer,
 )
 from db.albums import (
     DEFAULT_ALBUM_NAME, create_album, get_directories, get_grid_cell_width, get_thumbnail_width, list_albums,
     rename_album, set_directories, set_grid_cell_width, set_thumbnail_width,
 )
+from db.backup import backup_album, backup_daily, backup_dir, restore_album
 from db.connection import get_db_path, set_db_path
 from db.init import init_table
 from db.exclusions import add_excluded_paths, get_excluded_paths, remove_excluded_paths
-from db.tags import add_tag, remove_tags, rename_tags
-from db.videos import delete_videos, get_all_videos, get_thumbnails, rename_video, set_rating
+from db.tags import add_tag, delete_tags, remove_tags, rename_tags
+from db.videos import delete_videos, get_all_videos, rename_video, set_rating
 
 SORT_KEYS = {
     "名前": lambda v: os.path.basename(v["file_path"]).lower(),
@@ -49,6 +56,9 @@ TYPE_LABELS = {"video": "動画", "image": "画像"}
 THUMBNAIL_WIDTHS = {"小 (240px)": 240, "標準 (320px)": 320, "大 (480px)": 480, "特大 (640px)": 640}
 INVALID_FILENAME_CHARS = '\\/:*?"<>|'
 GROUP_ROLE = Qt.ItemDataRole.UserRole + 2   # タグ絞り込みツリーのグループ見出しに持たせるグループ名
+# 評価での絞り込み（表示名 -> 条件）
+RATING_FILTERS = {"すべて": None, "未評価のみ": 0} | {f"★{i} 以上": i for i in range(1, MAX_RATING + 1)}
+EXCLUDED_TAG_COLOR = QColor("#c62828")
 
 
 class VideoTagApp(QMainWindow):
@@ -60,12 +70,15 @@ class VideoTagApp(QMainWindow):
         self.settings = QSettings("tag-management-service", "VideoTagApp")
         self.videos: list[dict] = []
         self.video_by_id: dict[int, dict] = {}
-        self.icons: dict[int, QIcon] = {}
-        self.placeholder_icon = self.style().standardIcon(QStyle.StandardPixmap.SP_FileIcon)
+        self.excluded_tags: set[str] = set()  # 絞り込みで除外するタグ（このタグが付いたファイルは表示しない）
+        self.only_groups: dict[int, int] | None = None  # 重複だけを表示中: video_id -> グループ番号
+        self.duplicate_worker: DuplicateWorker | None = None
+        self.duplicate_dialog: DuplicateDialog | None = None
         self.scan_worker: ScanWorker | None = None
         self.scanning = False
 
         self._build_ui()
+        self.setAcceptDrops(True)  # フォルダ・ファイルをドラッグ＆ドロップで追加
         albums = [path for path, _ in list_albums()]
         album = self.settings.value("album/current", "")
         if album not in albums:
@@ -86,9 +99,13 @@ class VideoTagApp(QMainWindow):
         album_menu.addAction("新しいアルバム...", self.create_album)
         album_menu.addAction("アルバム名を変更...", self.rename_album)
         album_menu.addAction("サムネイルサイズ...", self.change_thumbnail_size)
+        album_menu.addAction("重複ファイルを検出...", self.find_duplicates)
         album_menu.addSeparator()
         album_menu.addAction("タグ・評価をエクスポート...", self.export_tags)
         album_menu.addAction("タグ・評価をインポート...", self.import_tags)
+        album_menu.addSeparator()
+        album_menu.addAction("バックアップから復元...", self.restore_backup)
+        album_menu.addAction("バックアップフォルダを開く", self.open_backup_folder)
         album_menu.addSeparator()
         self.delete_album_action = album_menu.addAction("アルバムを削除...", self.delete_album)
         self.album_menu_button.setMenu(album_menu)
@@ -158,7 +175,14 @@ class VideoTagApp(QMainWindow):
         operation_row.addWidget(self.label_toggle)
 
         # 2段目: 検索・種類・並び替え
+        self.only_groups_button = QPushButton()
+        self.only_groups_button.setToolTip("クリックすると、すべてのファイルの表示に戻ります")
+        self.only_groups_button.setStyleSheet("color: #c62828;")
+        self.only_groups_button.clicked.connect(self.clear_only_groups)
+        self.only_groups_button.hide()
+
         search_row = QHBoxLayout()
+        search_row.addWidget(self.only_groups_button)
         search_row.addWidget(self.search_edit, 1)
         search_row.addWidget(QLabel("種類:"))
         search_row.addWidget(self.type_combo)
@@ -175,7 +199,7 @@ class VideoTagApp(QMainWindow):
         # 左: タグフィルター
         self.tag_filter_list = QTreeWidget()
         self.tag_filter_list.setHeaderHidden(True)
-        self.tag_filter_list.itemChanged.connect(self.apply_filters)
+        self.tag_filter_list.itemChanged.connect(self.on_tag_filter_changed)
         self.tag_filter_list.itemExpanded.connect(self.on_tag_group_toggled)
         self.tag_filter_list.itemCollapsed.connect(self.on_tag_group_toggled)
         self.tag_filter_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -183,11 +207,24 @@ class VideoTagApp(QMainWindow):
         self.tag_mode_combo = QComboBox()
         self.tag_mode_combo.addItems(["すべて含む (AND)", "いずれか含む (OR)"])
         self.tag_mode_combo.currentIndexChanged.connect(self.apply_filters)
+        self.tag_filter_list.setToolTip("チェック: そのタグを含む / 右クリック →「除外」: そのタグを含まない")
+        self.rating_filter_combo = QComboBox()
+        self.rating_filter_combo.addItems(RATING_FILTERS)
+        self.rating_filter_combo.currentIndexChanged.connect(self.apply_filters)
+        self.untagged_check = QCheckBox("タグなしのみ（拡張子タグ以外）")
+        self.untagged_check.toggled.connect(self.apply_filters)
         clear_filter_button = QPushButton("絞り込み解除")
         clear_filter_button.clicked.connect(self.clear_tag_filter)
 
+        rating_filter_row = QHBoxLayout()
+        rating_filter_row.addWidget(QLabel("評価:"))
+        rating_filter_row.addWidget(self.rating_filter_combo, 1)
+
         left_layout = QVBoxLayout()
-        left_layout.addLayout(self._panel_header("タグで絞り込み", self.filter_toggle))
+        left_layout.addLayout(self._panel_header("絞り込み", self.filter_toggle))
+        left_layout.addLayout(rating_filter_row)
+        left_layout.addWidget(self.untagged_check)
+        left_layout.addWidget(QLabel("タグ"))
         left_layout.addWidget(self.tag_mode_combo)
         left_layout.addWidget(self.tag_filter_list, 1)
         left_layout.addWidget(clear_filter_button)
@@ -200,11 +237,8 @@ class VideoTagApp(QMainWindow):
         self.grid.zoom_requested.connect(
             lambda steps: self.cell_size_slider.setValue(self.cell_size_slider.value() + steps * CELL_WIDTH_STEP)
         )
-        self.grid.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
-        self.grid.itemSelectionChanged.connect(self.update_detail)
-        self.grid.itemDoubleClicked.connect(
-            lambda item: self.open_file(self.video_by_id[item.data(Qt.ItemDataRole.UserRole)]["file_path"])
-        )
+        self.grid.selection_changed.connect(self.update_detail)
+        self.grid.doubleClicked.connect(lambda index: self.open_file(self.video_by_id[index.data(ID_ROLE)]["file_path"]))
         for key, slot in ((QKeySequence.StandardKey.Delete, self.exclude_selection),
                           ("Shift+Delete", self.delete_selection), ("F2", self.rename_selection),
                           ("Ctrl+Shift+C", self.copy_selected_paths)):
@@ -318,14 +352,17 @@ class VideoTagApp(QMainWindow):
         """アルバム（DBファイル）を切り替えて一覧を読み込む"""
         set_db_path(path)
         init_table()
+        self._backup_daily(path)
         # 旧バージョンでアプリ設定に保存していた登録フォルダは、最初に開いたアルバムへ移す
         if self.settings.contains("directories"):
             if not get_directories():
                 set_directories(self.settings.value("directories", [], type=list))
             self.settings.remove("directories")
         self.settings.setValue("album/current", path)
-        self.icons.clear()
+        self.only_groups = None
+        self.only_groups_button.hide()
         self.grid.clearSelection()
+        self.grid.thumbnail_model.invalidate_thumbnails()
         self.cell_size_slider.blockSignals(True)
         self.cell_size_slider.setValue(get_grid_cell_width() or DEFAULT_CELL_WIDTH)
         self.cell_size_slider.blockSignals(False)
@@ -416,6 +453,74 @@ class VideoTagApp(QMainWindow):
         else:
             self.statusBar().showMessage(f"サムネイルサイズを「{label}」にしました（次回の再スキャンで作り直します）", 10000)
 
+    def find_duplicates(self):
+        """登録済みファイルから重複を探す（ファイルを読むのでバックグラウンドで行う）"""
+        if self.scanning or (self.duplicate_worker and self.duplicate_worker.isRunning()):
+            return
+        progress = QProgressDialog("重複ファイルを確認しています...", "中止", 0, 0, self)
+        progress.setWindowTitle("重複ファイルを検出")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(300)
+        worker = DuplicateWorker(self.videos, self)
+        worker.progress.connect(lambda done, total: (progress.setMaximum(total), progress.setValue(done)))
+        worker.found.connect(lambda groups: self.on_duplicates_found(groups, progress))
+        worker.finished.connect(progress.close)
+        progress.canceled.connect(worker.requestInterruption)
+        self.duplicate_worker = worker
+        worker.start()
+
+    def on_duplicates_found(self, groups: list[list[dict]], progress: QProgressDialog | None = None):
+        if progress:
+            progress.close()
+        if not groups:
+            QMessageBox.information(self, "重複ファイルを検出", "重複しているファイルは見つかりませんでした。")
+            return
+        self.duplicate_dialog = DuplicateDialog(self, groups)
+        self.duplicate_dialog.show()
+
+    def show_only_groups(self, groups: list[list[dict]]):
+        """一覧に、指定したグループのファイルだけをグループごとに並べて表示する"""
+        self.only_groups = {v["id"]: n for n, group in enumerate(groups) for v in group}
+        self.only_groups_button.setText(f"重複のみ表示中（{len(groups)} グループ） ✕")
+        self.only_groups_button.show()
+        self.apply_filters()
+
+    def clear_only_groups(self):
+        self.only_groups = None
+        self.only_groups_button.hide()
+        self.apply_filters()
+
+    def restore_backup(self):
+        """バックアップを選んで、現在のアルバムをその時点の状態に戻す"""
+        path = get_db_path()
+        directory = backup_dir(path)
+        if not os.path.isdir(directory):
+            QMessageBox.information(self, "バックアップから復元", "このアルバムのバックアップはまだありません。")
+            return
+        backup, _ = QFileDialog.getOpenFileName(self, "復元するバックアップを選択", directory, "アルバムDB (*.db)")
+        if not backup:
+            return
+        answer = QMessageBox.question(
+            self, "バックアップから復元",
+            f"アルバム「{self.album_combo.currentText()}」を、次のバックアップの状態に戻しますか？\n"
+            f"{os.path.basename(backup)}\n\n"
+            "今の状態も「復元前」としてバックアップしてから置き換えます。",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            restore_album(path, backup)
+        except (OSError, sqlite3.Error) as e:
+            QMessageBox.warning(self, "バックアップから復元", f"復元できませんでした:\n{e}")
+            return
+        self.open_album(path)
+        self.statusBar().showMessage(f"バックアップから復元しました: {os.path.basename(backup)}", 10000)
+
+    def open_backup_folder(self):
+        directory = backup_dir(get_db_path())
+        os.makedirs(directory, exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(os.path.abspath(directory)))
+
     def export_tags(self):
         album = self.album_combo.currentText()
         file_path, _ = QFileDialog.getSaveFileName(
@@ -435,6 +540,7 @@ class VideoTagApp(QMainWindow):
         if not file_path:
             return
         try:
+            self._backup("インポート")
             matched, unmatched = import_album(file_path)
         except (OSError, ValueError) as e:  # json.JSONDecodeError は ValueError
             QMessageBox.warning(self, "インポート", f"読み込めませんでした:\n{e}")
@@ -448,16 +554,9 @@ class VideoTagApp(QMainWindow):
 
     # ---------------------------------------------------------------- データ
     def reload_from_db(self):
-        """DBから一覧を再取得し、表示を更新"""
+        """DBから一覧を再取得し、表示を更新（サムネイルは表示されたときに読み込む）"""
         self.videos = get_all_videos()
         self.video_by_id = {v["id"]: v for v in self.videos}
-
-        missing = [v["id"] for v in self.videos if v["id"] not in self.icons]
-        for video_id, data in get_thumbnails(missing).items():
-            pixmap = QPixmap()
-            if pixmap.loadFromData(data):
-                self.icons[video_id] = QIcon(pixmap)
-
         self.refresh_tag_filter()
         self.completer_model.setStringList(sorted(self._all_tags(), key=str.lower))
         self.apply_filters()
@@ -475,12 +574,15 @@ class VideoTagApp(QMainWindow):
             else:
                 ungrouped.append(name)
 
+        self.excluded_tags &= set(counts)  # 無くなったタグの除外は解除する
+
         def add_tag_item(parent, name: str, text: str):
             item = QTreeWidgetItem(parent, [f"{text} ({counts[name]})"])
             item.setData(0, Qt.ItemDataRole.UserRole, name)
             item.setToolTip(0, name)
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             item.setCheckState(0, Qt.CheckState.Checked if name in checked else Qt.CheckState.Unchecked)
+            self._style_tag_item(item)
 
         self.tag_filter_list.blockSignals(True)
         self.tag_filter_list.clear()
@@ -510,11 +612,71 @@ class VideoTagApp(QMainWindow):
         group = item.data(0, GROUP_ROLE)
         if group is None:
             name = item.data(0, Qt.ItemDataRole.UserRole)
+            if name in self.excluded_tags:
+                menu.addAction("除外をやめる", lambda: self.set_tag_excluded(name, False))
+            else:
+                menu.addAction("このタグを除外して絞り込む", lambda: self.set_tag_excluded(name, True))
+            menu.addSeparator()
             menu.addAction("タグ名を変更...", lambda: self.rename_tag(name))
+            menu.addAction("タグを削除...", lambda: self.delete_tags([name]))
         else:
             menu.addAction("グループ名を変更...", lambda: self.rename_group(group))
             menu.addAction("グループを解除", lambda: self.ungroup(group))
+            menu.addSeparator()
+            menu.addAction("グループのタグをすべて削除...", lambda: self.delete_tags(self._group_tags(group), group))
         menu.exec(self.tag_filter_list.viewport().mapToGlobal(pos))
+
+    def on_tag_filter_changed(self, item: QTreeWidgetItem):
+        # 除外中のタグにチェックを入れたら、除外をやめて「含む」条件にする
+        name = item.data(0, Qt.ItemDataRole.UserRole)
+        if item.checkState(0) == Qt.CheckState.Checked and name in self.excluded_tags:
+            self.excluded_tags.discard(name)
+            self.tag_filter_list.blockSignals(True)
+            self._style_tag_item(item)
+            self.tag_filter_list.blockSignals(False)
+        self.apply_filters()
+
+    def set_tag_excluded(self, name: str, excluded: bool):
+        self.tag_filter_list.blockSignals(True)
+        for item in self._filter_tag_items():
+            if item.data(0, Qt.ItemDataRole.UserRole) == name:
+                if excluded:
+                    self.excluded_tags.add(name)
+                    item.setCheckState(0, Qt.CheckState.Unchecked)
+                else:
+                    self.excluded_tags.discard(name)
+                self._style_tag_item(item)
+        self.tag_filter_list.blockSignals(False)
+        self.apply_filters()
+
+    def _style_tag_item(self, item: QTreeWidgetItem):
+        """除外中のタグは赤字・取り消し線で表示する"""
+        excluded = item.data(0, Qt.ItemDataRole.UserRole) in self.excluded_tags
+        font = item.font(0)
+        font.setStrikeOut(excluded)
+        item.setFont(0, font)
+        item.setForeground(0, QBrush(EXCLUDED_TAG_COLOR) if excluded else QBrush())
+
+    def delete_tags(self, names: list[str], group: str | None = None):
+        """タグをすべてのファイルから外して削除する（ファイル自体は削除しない）"""
+        if not names:
+            return
+        files = sum(1 for v in self.videos if set(v["tags"]) & set(names))
+        target = f"グループ「{group}」のタグ {len(names)} 個" if group else f"タグ「{names[0]}」"
+        note = ""
+        if group == EXTENSION_TAG_GROUP or any(split_tag(n)[0] == EXTENSION_TAG_GROUP for n in names):
+            note = "\n（拡張子タグは、ファイルが変更・移動されたときの再スキャンで付け直されます）"
+        answer = QMessageBox.question(
+            self, "タグを削除",
+            f"{target}を、{files} 件のファイルから外して削除しますか？\nファイル自体は削除されません。{note}",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self._backup("タグを削除")
+        delete_tags(names)
+        self.excluded_tags -= set(names)
+        self.reload_from_db()
+        self.statusBar().showMessage(f"{target}を削除しました（{files} 件のファイルから外しました）", 10000)
 
     def rename_tag(self, name: str):
         new_name, ok = QInputDialog.getText(
@@ -562,7 +724,10 @@ class VideoTagApp(QMainWindow):
             if answer != QMessageBox.StandardButton.Yes:
                 return False
 
+        if merged:
+            self._backup("タグを統合")
         checked = {renames.get(t, t) for t in self._checked_filter_tags()}
+        self.excluded_tags = {renames.get(t, t) for t in self.excluded_tags}
         rename_tags(renames)
         self.reload_from_db()
         self.tag_filter_list.blockSignals(True)
@@ -586,52 +751,46 @@ class VideoTagApp(QMainWindow):
         self._save_collapsed_groups(collapsed - {group} if item.isExpanded() else collapsed | {group})
 
     def apply_filters(self):
-        """検索・種類・タグで絞り込み、並び替えて一覧を再描画"""
+        """検索・種類・評価・タグで絞り込み、並び替えて一覧を再描画"""
         keyword = self.search_edit.text().strip().lower()
         media_type = TYPE_FILTERS[self.type_combo.currentText()]
         tags = self._checked_filter_tags()
+        excluded = self.excluded_tags
         match_all = self.tag_mode_combo.currentIndex() == 0
+        min_rating = RATING_FILTERS[self.rating_filter_combo.currentText()]
+        untagged_only = self.untagged_check.isChecked()
+        only_groups = self.only_groups
 
         def matches(video):
             if media_type and video["media_type"] != media_type:
                 return False
             if keyword and keyword not in os.path.basename(video["file_path"]).lower():
                 return False
+            rating = video["rating"] or 0
+            if min_rating == 0 and rating != 0 or min_rating and rating < min_rating:
+                return False
+            video_tags = set(video["tags"])
+            if untagged_only and any(split_tag(t)[0] != EXTENSION_TAG_GROUP for t in video_tags):
+                return False
+            if excluded & video_tags:
+                return False
+            if only_groups is not None and video["id"] not in only_groups:
+                return False
             if tags:
-                video_tags = set(video["tags"])
                 return tags <= video_tags if match_all else bool(tags & video_tags)
             return True
 
-        result = sorted(
-            filter(matches, self.videos),
-            key=SORT_KEYS[self.sort_combo.currentText()],
-            reverse=self.order_combo.currentIndex() == 1,
-        )
+        sort_key = SORT_KEYS[self.sort_combo.currentText()]
+        result = sorted(filter(matches, self.videos), key=sort_key, reverse=self.order_combo.currentIndex() == 1)
+        if only_groups is not None:
+            result.sort(key=lambda v: only_groups[v["id"]])  # 重複はグループごとに並べる（グループ内は並び替え順）
 
-        selected = set(self._selected_ids())
-        self.grid.blockSignals(True)
-        self.grid.clear()
-        for video in result:
-            item = QListWidgetItem(
-                self.icons.get(video["id"], self.placeholder_icon),
-                os.path.basename(video["file_path"]) if self.grid.show_labels else "",
-            )
-            item.setData(Qt.ItemDataRole.UserRole, video["id"])
-            item.setData(RATING_ROLE, video["rating"] or 0)
-            item.setToolTip(
-                f"{video['file_path']}\n"
-                f"再生時間: {format_duration(video['duration'])}\n"
-                f"評価: {format_rating(video['rating'])}\n"
-                f"タグ: {', '.join(video['tags']) or '-'}"
-            )
-            self.grid.addItem(item)
-            if video["id"] in selected:
-                item.setSelected(True)
-        self.grid.blockSignals(False)
+        self.grid.set_videos(result)
 
         self.count_label.setText(f"{len(result)} / {len(self.videos)} 件")
-        # 絞り込みパネルを最小化していても、タグで絞り込み中であることが分かるようにする
-        self.filter_toggle.setText(f"絞り込み ({len(tags)})" if tags else "絞り込み")
+        # 絞り込みパネルを最小化していても、絞り込み中であることが分かるようにする（条件の数を表示）
+        conditions = len(tags) + len(excluded) + (min_rating is not None) + untagged_only
+        self.filter_toggle.setText(f"絞り込み ({conditions})" if conditions else "絞り込み")
         self.update_detail()
 
     def update_detail(self):
@@ -686,7 +845,6 @@ class VideoTagApp(QMainWindow):
     def set_show_labels(self, show: bool):
         self.settings.setValue("grid/show_labels", show)
         self.grid.set_show_labels(show)
-        self.apply_filters()
 
     def set_rating_to_selection(self, rating: int):
         ids = self._selected_ids()
@@ -716,6 +874,7 @@ class VideoTagApp(QMainWindow):
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
+        self._backup("DBから除外")
         add_excluded_paths([v["file_path"] for v in videos])
         delete_videos([v["id"] for v in videos])
         self.statusBar().showMessage(f"{len(videos)} 件をDBから除外しました", 10000)
@@ -776,6 +935,7 @@ class VideoTagApp(QMainWindow):
         if answer != QMessageBox.StandardButton.Yes:
             return
 
+        self._backup("ファイルを削除")
         deleted, failed = [], []
         for video in videos:
             path = video["file_path"]
@@ -817,6 +977,7 @@ class VideoTagApp(QMainWindow):
         if answer != QMessageBox.StandardButton.Yes:
             return False
 
+        self._backup("フォルダを除外")
         # 除外フォルダ自身・配下の登録フォルダはスキャン対象から外す
         set_directories([d for d in get_directories() if not is_same_or_under(d, directory)])
         # 除外一覧に表示し、別の登録フォルダ経由でも再登録されないよう記録する
@@ -831,44 +992,71 @@ class VideoTagApp(QMainWindow):
             FolderDialog(self).exec()
 
     def clear_tag_filter(self):
-        self.tag_filter_list.blockSignals(True)
+        """絞り込みパネルの条件（タグ・除外タグ・評価・タグなし）をすべて解除する"""
+        self.excluded_tags.clear()
+        for widget in (self.tag_filter_list, self.rating_filter_combo, self.untagged_check):
+            widget.blockSignals(True)
         for item in self._filter_tag_items():
             item.setCheckState(0, Qt.CheckState.Unchecked)
-        self.tag_filter_list.blockSignals(False)
+            self._style_tag_item(item)
+        self.rating_filter_combo.setCurrentIndex(0)
+        self.untagged_check.setChecked(False)
+        for widget in (self.tag_filter_list, self.rating_filter_combo, self.untagged_check):
+            widget.blockSignals(False)
         self.apply_filters()
 
     def choose_directory(self):
         directory = QFileDialog.getExistingDirectory(self, "動画・画像のフォルダを選択")
-        if not directory:
-            return
-        directory = os.path.normpath(directory)
-        dialog = self._ask_add_tags("フォルダを追加", directory)
-        if not dialog:
-            return
-        directories = get_directories()
-        if directory not in directories:
-            directories.append(directory)
-            set_directories(directories)
-        # フォルダを追加し直した場合は、以前除外したファイル・フォルダも再登録する
-        remove_excluded_paths([p for p in get_excluded_paths() if is_same_or_under(p, directory)])
-        self.start_scan([directory], dialog.tags(), tag_new_only=dialog.new_only())
+        if directory:
+            self.add_paths([directory], [], "フォルダを追加")
 
     def choose_files(self):
         patterns = " ".join(f"*{ext}" for ext in sorted(VIDEO_EXTENSIONS | IMAGE_EXTENSIONS))
         files, _ = QFileDialog.getOpenFileNames(
             self, "追加する動画・画像を選択", "", f"動画・画像 ({patterns});;すべてのファイル (*)",
         )
-        files = [os.path.normpath(f) for f in files if get_media_type(f)]
-        if not files:
+        if files:
+            self.add_paths([], files, "ファイルを追加")
+
+    def add_paths(self, directories: list[str], files: list[str], title: str = "追加"):
+        """フォルダ（登録フォルダになる）・ファイルを、追加時のタグを聞いてからスキャンする"""
+        if self.scanning:
             return
-        target = os.path.basename(files[0]) if len(files) == 1 else f"{len(files)} 件のファイル"
-        dialog = self._ask_add_tags("ファイルを追加", target)
+        directories = list(dict.fromkeys(os.path.normpath(d) for d in directories))
+        files = [os.path.normpath(f) for f in files if get_media_type(f)]
+        if not directories and not files:
+            self.statusBar().showMessage("追加できる動画・画像がありませんでした", 10000)
+            return
+        targets = directories + [os.path.basename(f) for f in files]
+        target = targets[0] if len(targets) == 1 else (
+            "、".join(filter(None, [f"フォルダ {len(directories)} 件" if directories else "",
+                                    f"ファイル {len(files)} 件" if files else ""]))
+        )
+        dialog = self._ask_add_tags(title, target)
         if not dialog:
             return
-        # 以前DBから除外したファイルでも、個別に追加した場合は再登録する
-        targets = {os.path.normcase(f) for f in files}
-        remove_excluded_paths([p for p in get_excluded_paths() if os.path.normcase(p) in targets])
-        self.start_scan([], dialog.tags(), files, tag_new_only=dialog.new_only())
+
+        registered = get_directories()
+        set_directories(registered + [d for d in directories if d not in registered])
+        # フォルダを追加し直した場合は、以前除外したファイル・フォルダも再登録する
+        # （個別に追加したファイルも、以前DBから除外していれば再登録する）
+        file_keys = {os.path.normcase(f) for f in files}
+        remove_excluded_paths([
+            p for p in get_excluded_paths()
+            if any(is_same_or_under(p, d) for d in directories) or os.path.normcase(p) in file_keys
+        ])
+        self.start_scan(directories, dialog.tags(), files, tag_new_only=dialog.new_only())
+
+    def dragEnterEvent(self, event):
+        if not self.scanning and any(url.isLocalFile() for url in event.mimeData().urls()):
+            event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        paths = [os.path.normpath(url.toLocalFile()) for url in event.mimeData().urls() if url.isLocalFile()]
+        event.acceptProposedAction()
+        directories = [p for p in paths if os.path.isdir(p)]
+        files = [p for p in paths if os.path.isfile(p)]
+        self.add_paths(directories, files, "ドラッグ＆ドロップで追加")
 
     def rescan_all(self):
         directories = get_directories()
@@ -918,19 +1106,18 @@ class VideoTagApp(QMainWindow):
         cancelled = self.scan_worker.isInterruptionRequested()
         summary = f"追加 {added} / 更新 {updated} / 移動 {moved} / 削除 {removed}"
         self.statusBar().showMessage(f"スキャンを中止しました: {summary}" if cancelled else f"スキャン完了: {summary}", 10000)
-        self.icons.clear()  # 更新されたファイルのサムネイルを読み直す
+        self.grid.thumbnail_model.invalidate_thumbnails()  # 更新されたファイルのサムネイルを読み直す
         self.reload_from_db()
 
     def show_grid_menu(self, pos):
         """サムネイル一覧の右クリックメニュー"""
-        item = self.grid.itemAt(pos)
-        if item is None:
+        video_id = self.grid.id_at(pos)
+        if video_id is None:
             return
         # 未選択の項目を右クリックした場合は、その項目だけを選択し直す
-        if not item.isSelected():
-            self.grid.clearSelection()
-            item.setSelected(True)
-        video = self.video_by_id[item.data(Qt.ItemDataRole.UserRole)]
+        if video_id not in self._selected_ids():
+            self.grid.select_ids([video_id])
+        video = self.video_by_id[video_id]
         selected = len(self._selected_ids())
 
         menu = QMenu(self)
@@ -984,9 +1171,10 @@ class VideoTagApp(QMainWindow):
             subprocess.run(["xdg-open", file_path])  # Linux
 
     def closeEvent(self, event):
-        if self.scan_worker and self.scan_worker.isRunning():
-            self.scan_worker.requestInterruption()
-            self.scan_worker.wait()
+        for worker in (self.scan_worker, self.duplicate_worker):
+            if worker and worker.isRunning():
+                worker.requestInterruption()
+                worker.wait()
         super().closeEvent(event)
 
     # ---------------------------------------------------------------- 補助
@@ -1011,6 +1199,19 @@ class VideoTagApp(QMainWindow):
         header.addWidget(minimize_button)
         return header
 
+    def _backup(self, reason: str):
+        """一括変更の前にアルバムのDBをバックアップする（失敗しても操作は続ける）"""
+        try:
+            backup_album(get_db_path(), reason)
+        except (OSError, sqlite3.Error) as e:
+            self.statusBar().showMessage(f"バックアップできませんでした: {e}", 10000)
+
+    def _backup_daily(self, path: str):
+        try:
+            backup_daily(path)
+        except (OSError, sqlite3.Error) as e:
+            self.statusBar().showMessage(f"バックアップできませんでした: {e}", 10000)
+
     def _set_scanning(self, scanning: bool):
         self.scanning = scanning
         for widget in self.scan_locked_widgets:
@@ -1021,7 +1222,7 @@ class VideoTagApp(QMainWindow):
         return {t for v in self.videos for t in v["tags"]}
 
     def _selected_ids(self) -> list[int]:
-        return [item.data(Qt.ItemDataRole.UserRole) for item in self.grid.selectedItems()]
+        return self.grid.selected_ids()
 
     def _selected_videos(self) -> list[dict]:
         return [self.video_by_id[i] for i in self._selected_ids()]

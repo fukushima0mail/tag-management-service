@@ -62,8 +62,7 @@ def test_search_by_filename(scanned):
 def test_sort_by_name_descending(scanned):
     scanned.sort_combo.setCurrentText("名前")
     scanned.order_combo.setCurrentText("降順")
-    names = [os.path.basename(scanned.video_by_id[scanned.grid.item(i).data(Qt.ItemDataRole.UserRole)]["file_path"])
-             for i in range(scanned.grid.count())]
+    names = [os.path.basename(scanned.video_by_id[i]["file_path"]) for i in scanned.grid.ids()]
     assert names == ["c.jpg", "b.png", "a.jpg"]
 
 
@@ -101,7 +100,7 @@ def test_ungroup(scanned):
 def test_rename_selection_renames_real_file(scanned, monkeypatch, media_dir):
     scanned.sort_combo.setCurrentText("名前")
     scanned.order_combo.setCurrentText("昇順")
-    scanned.grid.item(0).setSelected(True)  # a.jpg
+    scanned.grid.select_rows([0])  # a.jpg
     answer_input(monkeypatch, "renamed")
     scanned.rename_selection()
     assert (media_dir / "renamed.jpg").exists()
@@ -110,7 +109,7 @@ def test_rename_selection_renames_real_file(scanned, monkeypatch, media_dir):
 
 
 def test_exclude_selection_is_not_rescanned(scanned, qapp, media_dir):
-    scanned.grid.item(0).setSelected(True)
+    scanned.grid.select_rows([0])
     scanned.exclude_selection()
     assert len(scanned.videos) == 2
     scan_and_wait(scanned, qapp, [media_dir])

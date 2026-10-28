@@ -67,6 +67,19 @@ def rename_tags(renames: dict[str, str]):
                 )
                 c.execute("DELETE FROM tags WHERE id = ?", (old_id,))  # video_tags は ON DELETE CASCADE で削除
 
+def delete_tags(names: list[str]) -> int:
+    """タグをすべてのファイルから外して削除し、外した件数（ファイル×タグ）を返す"""
+    with DBConnection() as c:
+        placeholders = ",".join("?" * len(names))
+        c.execute(
+            f"SELECT COUNT(*) FROM video_tags WHERE tag_id IN (SELECT id FROM tags WHERE name IN ({placeholders}))",
+            names,
+        )
+        count = c.fetchone()[0]
+        c.execute(f"DELETE FROM tags WHERE name IN ({placeholders})", names)  # video_tags は ON DELETE CASCADE
+    return count
+
+
 def migrate_extension_tags(extension_tag):
     """旧形式の拡張子タグ（例: jpg）を新形式（例: 拡張子:jpg）に置き換える
 

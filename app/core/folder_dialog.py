@@ -41,6 +41,7 @@ class FolderDialog(QDialog):
         self.unexclude_button.clicked.connect(self._unexclude_selected)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.button(QDialogButtonBox.StandardButton.Close).setText("閉じる")
         buttons.rejected.connect(self.reject)
 
         self.drive_warning = QLabel()

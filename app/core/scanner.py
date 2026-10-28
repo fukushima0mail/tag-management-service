@@ -1,4 +1,5 @@
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from PyQt6.QtCore import QThread, pyqtSignal
 
@@ -6,7 +7,11 @@ from core.media import extension_tag, is_same_or_under, iter_media_files, load_m
 from db.albums import get_thumbnail_width
 from db.exclusions import get_excluded_paths
 from db.tags import add_tag
-from db.videos import add_video, delete_videos, get_outdated_thumbnail_ids, get_video_index, rename_video
+from db.videos import add_videos, delete_videos, get_outdated_thumbnail_ids, get_video_index, rename_video
+
+# サムネイル作成を並列に行う数（ffmpeg を同時に起動する数）
+SCAN_WORKERS = max(1, min(4, (os.cpu_count() or 2) // 2))
+WRITE_BATCH_SIZE = 25  # DBへまとめて書き込む件数
 
 
 def _is_excluded(path: str, excluded: set[str]) -> bool:
@@ -52,17 +57,20 @@ class ScanWorker(QThread):
         index = get_video_index()
         thumbnail_width = get_thumbnail_width()
         outdated = get_outdated_thumbnail_ids(thumbnail_width)  # サムネイルサイズを変えた後のファイル
-        added = updated = moved = 0
+        self._done, self._total = 0, len(files)
+        moved = 0
         missing = None  # (サイズ, 更新日時) -> 実ファイルが見つからない登録済みファイルの (パス, ID)
         scanned_ids = []
-        for i, path in enumerate(files, 1):
+        to_process = []  # サムネイル作成が必要なファイル: (パス, stat, 登録済みか)
+
+        # 1. 変更のないファイル・移動したファイルを振り分ける（stat だけなので速い）
+        for path in files:
             if self.isInterruptionRequested():
                 break
-            self.progress.emit(i, len(files), path)
-
             try:
                 stat = os.stat(path)
             except OSError:
+                self._advance(path)
                 continue
 
             # サイズ・更新日時が変わっておらず、サムネイルも今のサイズのファイルは再処理しない
@@ -72,6 +80,7 @@ class ScanWorker(QThread):
                 if size == stat.st_size and mtime == stat.st_mtime and existing_id not in outdated:
                     if not self.tag_new_only:
                         scanned_ids.append(existing_id)
+                    self._advance(path)
                     continue
             else:
                 # 移動・リネームされたファイルは、登録済みの情報（タグ・評価）を引き継ぐ
@@ -87,17 +96,12 @@ class ScanWorker(QThread):
                     if not self.tag_new_only:
                         scanned_ids.append(video_id)
                     moved += 1
+                    self._advance(path)
                     continue
+            to_process.append((path, stat, existing is not None))
 
-            media_type, duration, thumbnail = load_media_info(path, thumbnail_width)
-            video_id = add_video(path, media_type, duration, thumbnail, stat.st_size, stat.st_mtime, thumbnail_width)
-            add_tag([video_id], extension_tag(path))
-            if not (existing and self.tag_new_only):
-                scanned_ids.append(video_id)
-            if existing:
-                updated += 1
-            else:
-                added += 1
+        # 2. サムネイル作成（ffmpeg・画像の読み込み）を並列に行い、DBへはまとめて書き込む
+        added, updated = self._process(to_process, thumbnail_width, scanned_ids)
 
         self._add_tags(scanned_ids)
         if self.isInterruptionRequested():
@@ -117,6 +121,51 @@ class ScanWorker(QThread):
         ]
         delete_videos(stale)
         self.scan_finished.emit(added, updated, len(stale), moved)
+
+    def _process(self, items: list[tuple], thumbnail_width: int, scanned_ids: list[int]) -> tuple[int, int]:
+        """サムネイルを並列に作ってDBへ登録し、(追加, 更新) の件数を返す（中止されたら作成済みの分だけ登録する）"""
+        added = updated = 0
+        batch, batch_meta = [], []
+
+        def flush():
+            nonlocal added, updated
+            if not batch:
+                return
+            for video_id, (path, existing) in zip(add_videos(batch), batch_meta):
+                if not (existing and self.tag_new_only):
+                    scanned_ids.append(video_id)
+                if existing:
+                    updated += 1
+                else:
+                    added += 1
+            batch.clear()
+            batch_meta.clear()
+
+        executor = ThreadPoolExecutor(max_workers=SCAN_WORKERS)
+        try:
+            futures = {
+                executor.submit(load_media_info, path, thumbnail_width): (path, stat, existing)
+                for path, stat, existing in items
+            }
+            for future in as_completed(futures):
+                path, stat, existing = futures[future]
+                media_type, duration, thumbnail = future.result()
+                batch.append((path, media_type, duration, thumbnail, stat.st_size, stat.st_mtime,
+                              thumbnail_width, extension_tag(path)))
+                batch_meta.append((path, existing))
+                self._advance(path)
+                if len(batch) >= WRITE_BATCH_SIZE:
+                    flush()
+                if self.isInterruptionRequested():
+                    break
+        finally:
+            executor.shutdown(wait=True, cancel_futures=True)
+        flush()
+        return added, updated
+
+    def _advance(self, path: str):
+        self._done += 1
+        self.progress.emit(self._done, self._total, path)
 
     def _collect_files(self) -> list[str]:
         """スキャン対象のファイル一覧（中止された時点で打ち切る）"""

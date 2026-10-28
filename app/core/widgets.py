@@ -1,12 +1,13 @@
-from PyQt6.QtCore import QRect, QSize, QStringListModel, Qt, pyqtSignal
+from PyQt6.QtCore import QItemSelection, QItemSelectionModel, QRect, QSize, QStringListModel, Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QFont, QFontMetrics, QIcon, QPainter, QPalette, QPen
 from PyQt6.QtWidgets import (
-    QCheckBox, QCompleter, QDialog, QDialogButtonBox, QLabel, QLineEdit, QListWidget, QStyle,
+    QAbstractItemView, QCheckBox, QCompleter, QDialog, QDialogButtonBox, QLabel, QLineEdit, QListView, QStyle,
     QStyledItemDelegate, QStyleOptionViewItem, QVBoxLayout,
 )
 
 from core.formatting import MAX_RATING
 from core.tags import parse_tags
+from core.thumbnail_model import ID_ROLE, RATING_ROLE, ThumbnailModel
 
 DEFAULT_CELL_WIDTH = 160  # 一覧のセル幅の目安（これより狭くなる場合は列数を減らす）
 MIN_CELL_WIDTH = 100
@@ -14,7 +15,6 @@ MAX_CELL_WIDTH = 640
 CELL_WIDTH_STEP = 20      # Ctrl+ホイール1段で変える幅
 CELL_PADDING = 20       # セル幅とサムネイル幅の差
 LABEL_HEIGHT = 45       # ファイル名（2行）の表示領域
-RATING_ROLE = Qt.ItemDataRole.UserRole + 1  # サムネイル一覧の各項目に持たせる評価
 STAR_FILLED_COLOR = QColor("#FFC107")
 STAR_EMPTY_COLOR = QColor(255, 255, 255, 110)
 SELECTION_BORDER_WIDTH = 4
@@ -121,21 +121,65 @@ class ThumbnailDelegate(QStyledItemDelegate):
         painter.restore()
 
 
-class ThumbnailGrid(QListWidget):
+class ThumbnailGrid(QListView):
     """幅に合わせてセルサイズを調整するサムネイル一覧（セル幅の目安は cell_width で変えられる）"""
 
     zoom_requested = pyqtSignal(int)  # Ctrl+ホイールの回転量（+1 で拡大、-1 で縮小）
+    selection_changed = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setViewMode(QListWidget.ViewMode.IconMode)
-        self.setResizeMode(QListWidget.ResizeMode.Adjust)
-        self.setMovement(QListWidget.Movement.Static)
+        self.setViewMode(QListView.ViewMode.IconMode)
+        self.setResizeMode(QListView.ResizeMode.Adjust)
+        self.setMovement(QListView.Movement.Static)
         self.setUniformItemSizes(True)
         self.setWordWrap(True)
+        self.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.thumbnail_model = ThumbnailModel(self.style().standardIcon(QStyle.StandardPixmap.SP_FileIcon), self)
+        self.setModel(self.thumbnail_model)
+        self.selectionModel().selectionChanged.connect(self.selection_changed)
         self.show_labels = True
         self.cell_width = DEFAULT_CELL_WIDTH
         self._fit_cells()
+
+    # ------------------------------------------------------------ 一覧・選択
+    def set_videos(self, videos: list[dict]):
+        """一覧を入れ替える（選択中のファイルは、入れ替え後も残っていれば選択したままにする）"""
+        selected = self.selected_ids()
+        self.selectionModel().blockSignals(True)
+        self.thumbnail_model.set_videos(videos)
+        self.select_ids(selected)
+        self.selectionModel().blockSignals(False)
+
+    def count(self) -> int:
+        return self.thumbnail_model.rowCount()
+
+    def ids(self) -> list[int]:
+        """表示順の video_id"""
+        return self.thumbnail_model.ids()
+
+    def selected_ids(self) -> list[int]:
+        """選択中の video_id（表示順）"""
+        rows = sorted(index.row() for index in self.selectionModel().selectedIndexes())
+        return [self.thumbnail_model.video_at(row)["id"] for row in rows]
+
+    def select_ids(self, ids, clear: bool = True):
+        rows = [r for r in map(self.thumbnail_model.row_of, ids) if r is not None]
+        self.select_rows(rows, clear)
+
+    def select_rows(self, rows, clear: bool = True):
+        selection = QItemSelection()
+        for row in rows:
+            index = self.thumbnail_model.index(row)
+            selection.select(index, index)
+        flags = QItemSelectionModel.SelectionFlag.Select
+        if clear:
+            flags |= QItemSelectionModel.SelectionFlag.Clear
+        self.selectionModel().select(selection, flags)
+
+    def id_at(self, pos) -> int | None:
+        index = self.indexAt(pos)
+        return index.data(ID_ROLE) if index.isValid() else None
 
     def set_cell_width(self, width: int):
         self.cell_width = max(MIN_CELL_WIDTH, min(MAX_CELL_WIDTH, width))
@@ -153,6 +197,7 @@ class ThumbnailGrid(QListWidget):
     def set_show_labels(self, show: bool):
         """ファイル名を非表示にした場合は、その分セルの高さを詰める"""
         self.show_labels = show
+        self.thumbnail_model.set_show_labels(show)
         self._fit_cells()
 
     def resizeEvent(self, event):

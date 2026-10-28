@@ -83,8 +83,7 @@ def test_size_is_kept_after_restart(window):
 
 def test_small_thumbnail_is_scaled_up_to_cell(qapp):
     """元画像（320px）より大きいセルでは、サムネイルをセルいっぱいに拡大して描く"""
-    from PyQt6.QtGui import QColor, QIcon, QPixmap
-    from PyQt6.QtWidgets import QListWidgetItem
+    from PyQt6.QtGui import QColor, QPixmap
     from core.widgets import ThumbnailDelegate
 
     grid = ThumbnailGrid()
@@ -93,11 +92,12 @@ def test_small_thumbnail_is_scaled_up_to_cell(qapp):
     grid.set_cell_width(640)
     pixmap = QPixmap(320, 180)
     pixmap.fill(QColor("red"))
-    grid.addItem(QListWidgetItem(QIcon(pixmap), "a.jpg"))
+    grid.thumbnail_model.cache.put(1, pixmap)  # 読み込み済みのサムネイル
+    grid.set_videos([{"id": 1, "file_path": "a.jpg", "rating": 0, "duration": None, "tags": []}])
     grid.show()
     qapp.processEvents()
 
-    rect = grid.visualItemRect(grid.item(0))
+    rect = grid.visualRect(grid.thumbnail_model.index(0))
     assert grid.iconSize().width() > 320
     image = grid.viewport().grab().toImage()
     # 元画像の幅（320px）を超えた位置まで赤く塗られている
