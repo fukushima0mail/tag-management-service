@@ -45,6 +45,10 @@ class ThumbnailCache:
             _, old = self._items.popitem(last=False)
             self._bytes -= _pixmap_bytes(old)
 
+    def discard(self, video_id: int):
+        if video_id in self._items:
+            self._bytes -= _pixmap_bytes(self._items.pop(video_id))
+
     def clear(self):
         self._items.clear()
         self._bytes = 0
@@ -96,6 +100,14 @@ class ThumbnailModel(QAbstractListModel):
         self.cache.clear()
         if self._videos:
             self.dataChanged.emit(self.index(0), self.index(len(self._videos) - 1), [Qt.ItemDataRole.DecorationRole])
+
+    def invalidate_thumbnail(self, video_id: int):
+        """1件のサムネイルを読み直す"""
+        self.cache.discard(video_id)
+        row = self._rows.get(video_id)
+        if row is not None:
+            index = self.index(row)
+            self.dataChanged.emit(index, index, [Qt.ItemDataRole.DecorationRole])
 
     # ------------------------------------------------------------ Qt モデル
     def rowCount(self, parent=QModelIndex()) -> int:

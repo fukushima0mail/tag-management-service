@@ -16,7 +16,8 @@ def create_videos_table():
                 file_size INTEGER,
                 modified_at REAL,
                 rating INTEGER NOT NULL DEFAULT 0,
-                thumbnail_width INTEGER
+                thumbnail_width INTEGER,
+                thumbnail_position REAL
             )
         """)
 
@@ -29,6 +30,7 @@ def create_videos_table():
             ("modified_at", "REAL"),
             ("rating", "INTEGER NOT NULL DEFAULT 0"),
             ("thumbnail_width", "INTEGER"),  # サムネイルを作ったときの幅（NULL は既定の幅）
+            ("thumbnail_position", "REAL"),  # サムネイルにした動画の位置（秒、NULL は既定の位置）
         ):
             if name not in columns:
                 c.execute(f"ALTER TABLE videos ADD COLUMN {name} {definition}")
@@ -88,6 +90,29 @@ def get_outdated_thumbnail_ids(width: int) -> set[int]:
     with DBConnection() as c:
         c.execute("SELECT id FROM videos WHERE COALESCE(thumbnail_width, ?) != ?", (DEFAULT_THUMBNAIL_WIDTH, width))
         return {row[0] for row in c.fetchall()}
+
+
+def set_thumbnail(video_id: int, thumbnail: bytes | None, width: int, position: float | None):
+    """1件のサムネイルを差し替える（position は選んだ動画の位置。再スキャンで作り直すときもこの位置を使う）"""
+    with DBConnection() as c:
+        c.execute(
+            "UPDATE videos SET thumbnail = ?, thumbnail_width = ?, thumbnail_position = ? WHERE id = ?",
+            (thumbnail, width, position, video_id),
+        )
+
+
+def get_thumbnail_positions() -> dict[str, float]:
+    """file_path -> サムネイルにする位置（選び直したファイルのみ）"""
+    with DBConnection() as c:
+        c.execute("SELECT file_path, thumbnail_position FROM videos WHERE thumbnail_position IS NOT NULL")
+        return dict(c.fetchall())
+
+
+def get_thumbnail_position(video_id: int) -> float | None:
+    with DBConnection() as c:
+        c.execute("SELECT thumbnail_position FROM videos WHERE id = ?", (video_id,))
+        row = c.fetchone()
+        return row[0] if row else None
 
 
 def delete_videos(video_ids: list[int]):

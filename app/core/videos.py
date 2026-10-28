@@ -14,6 +14,7 @@ from PyQt6.QtWidgets import (
 )
 
 from core.duplicate_dialog import DuplicateDialog
+from core import media
 from core.duplicates import DuplicateWorker
 from core.folder_dialog import FolderDialog
 from core.formatting import (
@@ -25,6 +26,7 @@ from core.media import (
 from core.scanner import ScanWorker
 from core.tags import normalize_tag, split_tag
 from core.transfer import export_album, import_album
+from core.thumbnail_dialog import ThumbnailSceneDialog, format_position
 from core.thumbnail_model import ID_ROLE
 from core.widgets import (
     CELL_WIDTH_STEP, DEFAULT_CELL_WIDTH, MAX_CELL_WIDTH, MIN_CELL_WIDTH, AddTagsDialog, ThumbnailDelegate,
@@ -39,7 +41,9 @@ from db.connection import get_db_path, set_db_path
 from db.init import init_table
 from db.exclusions import add_excluded_paths, get_excluded_paths, remove_excluded_paths
 from db.tags import add_tag, delete_tags, remove_tags, rename_tags
-from db.videos import delete_videos, get_all_videos, rename_video, set_rating
+from db.videos import (
+    delete_videos, get_all_videos, get_thumbnail_position, rename_video, set_rating, set_thumbnail,
+)
 
 SORT_KEYS = {
     "名前": lambda v: os.path.basename(v["file_path"]).lower(),
@@ -1128,10 +1132,41 @@ class VideoTagApp(QMainWindow):
         menu.addSeparator()
         rename = menu.addAction("名前を変更 (F2)", self.rename_selection)
         rename.setEnabled(selected == 1 and not self.scanning)
+        is_video = video["media_type"] == "video"
+        regenerate = menu.addAction("サムネイルの場面を選ぶ..." if is_video else "サムネイルを作り直す",
+                                    lambda: self.regenerate_thumbnail(video))
+        regenerate.setEnabled(selected == 1 and not self.scanning and (not is_video or media.ffmpeg is not None))
         for text, slot in (("DBから除外 (Delete)", self.exclude_selection),
                            ("ファイルを削除 (Shift+Delete)", self.delete_selection)):
             menu.addAction(text, slot).setEnabled(not self.scanning)
         menu.exec(self.grid.viewport().mapToGlobal(pos))
+
+    def regenerate_thumbnail(self, video: dict):
+        """1件のサムネイルを作り直す（動画は場面を選ぶ。選んだ位置は再スキャンで作り直すときも使う）"""
+        path = video["file_path"]
+        if not os.path.exists(path):
+            QMessageBox.warning(self, "サムネイルを作り直す", f"ファイルが見つかりません:\n{path}")
+            return
+        width = get_thumbnail_width()
+        if video["media_type"] == "video":
+            duration = video["duration"] or media.get_video_duration(path)
+            if not duration:
+                QMessageBox.warning(self, "サムネイルの場面を選ぶ", f"動画の再生時間を取得できませんでした:\n{path}")
+                return
+            dialog = ThumbnailSceneDialog(path, duration, width, get_thumbnail_position(video["id"]), self)
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return
+            thumbnail, position = dialog.thumbnail, dialog.position
+            message = f"サムネイルを {format_position(position)} の場面にしました"
+        else:
+            thumbnail, position = media.generate_image_thumbnail(path, width), None
+            if thumbnail is None:
+                QMessageBox.warning(self, "サムネイルを作り直す", f"サムネイルを作れませんでした:\n{path}")
+                return
+            message = "サムネイルを作り直しました"
+        set_thumbnail(video["id"], thumbnail, width, position)
+        self.grid.thumbnail_model.invalidate_thumbnail(video["id"])
+        self.statusBar().showMessage(f"{message}: {os.path.basename(path)}", 5000)
 
     def reveal_file(self, file_path: str):
         """ファイルの場所をエクスプローラー（Finder）で開き、そのファイルを選択状態にする"""

@@ -7,7 +7,9 @@ from core.media import extension_tag, is_same_or_under, iter_media_files, load_m
 from db.albums import get_thumbnail_width
 from db.exclusions import get_excluded_paths
 from db.tags import add_tag
-from db.videos import add_videos, delete_videos, get_outdated_thumbnail_ids, get_video_index, rename_video
+from db.videos import (
+    add_videos, delete_videos, get_outdated_thumbnail_ids, get_thumbnail_positions, get_video_index, rename_video,
+)
 
 # サムネイル作成を並列に行う数（ffmpeg を同時に起動する数）
 SCAN_WORKERS = max(1, min(4, (os.cpu_count() or 2) // 2))
@@ -141,10 +143,11 @@ class ScanWorker(QThread):
             batch.clear()
             batch_meta.clear()
 
+        positions = get_thumbnail_positions() if items else {}  # サムネイルの位置を選び直したファイルはその位置で作る
         executor = ThreadPoolExecutor(max_workers=SCAN_WORKERS)
         try:
             futures = {
-                executor.submit(load_media_info, path, thumbnail_width): (path, stat, existing)
+                executor.submit(load_media_info, path, thumbnail_width, positions.get(path)): (path, stat, existing)
                 for path, stat, existing in items
             }
             for future in as_completed(futures):

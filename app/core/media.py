@@ -74,12 +74,13 @@ def thumbnail_box(width: int) -> tuple[int, int]:
     return width, width * 9 // 16
 
 
-def load_media_info(file_path: str, thumbnail_width: int = DEFAULT_THUMBNAIL_WIDTH) -> tuple[str, float | None, bytes | None]:
-    """(メディア種別, 再生時間, サムネイルJPEG) を返す"""
+def load_media_info(file_path: str, thumbnail_width: int = DEFAULT_THUMBNAIL_WIDTH,
+                    position: float | None = None) -> tuple[str, float | None, bytes | None]:
+    """(メディア種別, 再生時間, サムネイルJPEG) を返す（position は動画のサムネイルにする位置。None なら既定の位置）"""
     media_type = get_media_type(file_path)
     if media_type == "video":
         duration = get_video_duration(file_path)
-        return media_type, duration, generate_video_thumbnail(file_path, duration, thumbnail_width)
+        return media_type, duration, generate_video_thumbnail(file_path, duration, thumbnail_width, position)
     return media_type, None, generate_image_thumbnail(file_path, thumbnail_width)
 
 
@@ -95,13 +96,20 @@ def get_video_duration(file_path: str) -> float | None:
         return None
 
 
+def default_thumbnail_position(duration: float | None) -> float:
+    """既定のサムネイル位置: 短い動画でも取得できるよう、5秒地点か動画の中間の早い方"""
+    return min(5.0, duration / 2) if duration else 0
+
+
 def generate_video_thumbnail(file_path: str, duration: float | None,
-                             width: int = DEFAULT_THUMBNAIL_WIDTH) -> bytes | None:
-    """ffmpegで動画のフレームを取得し、サムネイルJPEGとして返す"""
+                             width: int = DEFAULT_THUMBNAIL_WIDTH, position: float | None = None) -> bytes | None:
+    """ffmpegで動画の position 秒地点（None なら既定の位置）のフレームを取得し、サムネイルJPEGとして返す"""
     if ffmpeg is None:
         return None
-    # 短い動画でも取得できるよう、5秒地点か動画の中間の早い方を使う
-    position = min(5.0, duration / 2) if duration else 0
+    if position is None:
+        position = default_thumbnail_position(duration)
+    elif duration:
+        position = max(0.0, min(position, duration - 0.1))  # ファイルが差し替わって短くなっていても取得できるように
     try:
         out = _run(
             ffmpeg
